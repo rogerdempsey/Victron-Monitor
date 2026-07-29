@@ -5,10 +5,12 @@ SmartSolar/BlueSolar MPPT controller over Bluetooth Low Energy "Instant
 Readout" broadcasts (no pairing, no cables to the Victron gear needed), and
 serves a live dashboard at **http://192.168.8.66/**.
 
-It also polls a diesel heater fuel-flow monitor and an icebox controller
-over Wi-Fi (separate small ESP boards on the boat's network), and reads
-3 DS18B20 temperature probes wired directly to the ESP32 (Cabin1, Cabin2,
-Outside) — folding all of it into the same dashboard.
+It also listens for fuel-flow/tank-level data pushed over UDP from a
+diesel heater board, and fridge/crisper data pushed from an icebox
+controller (separate small ESP boards on the boat's network, each with
+their own local dashboard too), plus reads 3 DS18B20 temperature probes
+wired directly to this ESP32 (Cabin1, Cabin2, Outside) — folding all of
+it into the same dashboard.
 
 The dashboard shows a **GPS** pill near the top that turns green when
 NMEA sentences are actively coming in and red when they aren't
@@ -216,19 +218,45 @@ All 3 probes wire to the same 3 points in parallel (VCC together, GND
 together, DATA together) — that's the point of 1-Wire, each probe has a
 unique factory-set address so they can share one bus.
 
-**Probe identification**: right now, "Cabin1"/"Cabin2"/"Outside" are
-assigned by the order each probe is discovered on the bus at boot (1st
-found = Cabin1, 2nd = Cabin2, 3rd = Outside), not by which physical probe
-you've labeled which. Since discovery order depends on each probe's
-unique hardware address rather than which physical port it's plugged
-into, there's no "port 1/2/3" to match against a label — the practical
-way to identify which one is which is to warm one probe at a time (e.g.
-hold it in your hand) and watch the dashboard to see which reading
-moves. If a probe's connection is flaky and drops on/off the bus, the
-*other two's* labels can shift as a result — the Serial Monitor at boot
-prints each probe's actual address, which is the fix if that ever
-becomes a problem (swap to address-based lookup in `pollTemps()` in
-`src/main.cpp` instead of index lookups).
+**Probe identification**: each probe is matched to Cabin1/Cabin2/Outside
+by its actual hardware address, not by the order it happens to enumerate
+on the bus — so it doesn't matter what order they're wired in, and one
+probe temporarily dropping off the bus can't cause the others to get
+mislabeled. Each probe's 6-byte serial number (printed on the probe
+itself) is hardcoded in `TEMP_PROBE_SERIAL` near the top of
+`src/main.cpp`, matched to the `Cabin1`/`Cabin2`/`Outside` names in
+`TEMP_PROBE_NAMES` right above it (same order, index for index). If you
+ever replace a probe, update its serial number there and reflash — the
+Serial Monitor at boot confirms whether each *named* probe was actually
+found, rather than just listing whatever it happened to discover.
+
+## How the heater and icebox boards connect
+
+Unlike the GPS feed (broadcast to the whole network, since multiple
+programs might want it) or the old design (this board polling each of
+them over HTTP), the heater and icebox boards **push** their data here
+over plain UDP unicast — fire-and-forget, no TCP connection or socket
+lifecycle on either side, sent straight to this board's IP
+(`192.168.8.66`) on port **2000**. This board just listens; there's
+nothing to configure here for it to work, but it's worth understanding
+for troubleshooting:
+
+- Both boards send to the *same* port; this board tells them apart by
+  which IP the packet came from (`HEATER_IP`/`ICEBOX_IP` near the top of
+  `src/main.cpp`).
+- If either board's Wi-Fi is down, or it can't reach this board's IP,
+  its card here just goes stale (same "hasn't updated in 15s" red-dot
+  behavior as everything else) — there's no retry from this end to
+  configure, since it's the *other* board initiating each send.
+- If this board's static IP (`192.168.8.66`) is ever changed, the
+  matching `DASHBOARD_IP` constant needs updating on **both** the heater
+  and icebox boards' own firmware too, or their telemetry has nowhere to
+  go.
+- Some routers/access points have a "client isolation" or "AP isolation"
+  setting that blocks device-to-device traffic on the same Wi-Fi network
+  (it's meant for public/guest networks). If telemetry never arrives
+  despite everything looking fine on both ends, that setting is worth
+  checking and temporarily disabling to test.
 
 ## Connecting OpenCPN
 
@@ -264,9 +292,11 @@ something's wrong and power-cycle it:
 - **Task watchdog**: if a single pass through the main loop ever takes
   longer than 20 seconds — a genuinely stuck network call, a library
   deadlock, anything — the watchdog reboots the board automatically.
-  Normal operation never comes close to 20s (worst case today is ~2s,
-  from the heater/icebox HTTP timeouts), so this only fires on a real
-  hang.
+  Normal operation never comes close to 20s (nothing in the main loop
+  blocks for any real length of time: BLE scanning and GPS/heater/icebox
+  UDP reads are all non-blocking, and the DS18B20 temperature reads are
+  spread across multiple loop() passes instead of blocking for their
+  ~750ms conversion time), so this only fires on a real hang.
 - **Wi-Fi connect timeout**: at boot, if Wi-Fi hasn't connected within
   60 seconds (e.g. the router isn't up yet after a full power-down), the
   board reboots and tries the whole boot sequence again, rather than
@@ -276,6 +306,19 @@ something's wrong and power-cycle it:
   reserves RAM for Classic BT by default regardless. That memory gets
   released back to the heap at boot, which matters a lot on a board this
   tight on RAM.
+- **Internal core debug logging disabled** (`CORE_DEBUG_LEVEL=0` in
+  `platformio.ini`): the ESP32 Arduino core logs certain internal events
+  (like a dropped web server connection) straight to the same UART used
+  for the Serial Monitor. If nothing's actively reading that UART (no
+  Serial Monitor attached), and enough of these build up, the write can
+  *block* until there's room - and since that can happen from inside the
+  web server's own connection handling, a blocked log write stalls the
+  whole dashboard along with it. This was the actual cause of a
+  "sluggish unless I have the Serial Monitor open" pattern that looked
+  for a while like it might be a memory leak. Turning this logging off
+  entirely removes the only thing that could ever queue up and block a
+  UART write during normal operation, so this shouldn't need a Serial
+  Monitor attached to run smoothly.
 
 **Reading the heap footer**: the dashboard footer shows uptime, free
 heap at boot, free heap right now, and the largest allocatable block.
@@ -324,10 +367,14 @@ tracking down a root cause than the reboot alone.
 - **Can't reach the web page**: confirm the ESP32's static IP didn't
   conflict with another device, and that your computer/phone is on the
   same network/subnet.
-- **Heater or icebox card stuck on "no data"**: confirm that board is
-  powered up and reachable at its IP on the same network — the dashboard
-  just polls their HTTP APIs over Wi-Fi, so if that board's Wi-Fi is
-  down or its IP changed, its card goes stale/red here too.
+- **Heater or icebox card stuck on "no data"**: since these now push
+  their data here (see **How the heater and icebox boards connect**
+  above) rather than being polled, check that the *other* board is
+  powered up, connected to Wi-Fi, and actually sending - its own Serial
+  Monitor should show a "Telemetry UDP -> ..." line at boot. Also worth
+  checking client/AP isolation on your router if it's never worked at
+  all, and that `DASHBOARD_IP` on that board still matches this board's
+  actual static IP.
 - **A temperature probe shows "no probe"**: double-check the pull-up
   resistor is actually there (a very common miss — 1-Wire won't work at
   all without it, even though it's "just" a resistor) and that the
@@ -354,6 +401,6 @@ victron-monitor/
 │   ├── secrets.h.example  # Template - copy to secrets.h and fill in
 │   └── secrets.h          # Your real Wi-Fi/Victron credentials (gitignored)
 ├── src/
-│   └── main.cpp        # WiFi + BLE scanning + heater/icebox polling + temp probes + web dashboard + NMEA0183 UDP gateway
+│   └── main.cpp        # WiFi + BLE scanning + heater/icebox UDP telemetry + temp probes + web dashboard + NMEA0183 UDP gateway
 └── README.md
 ```
