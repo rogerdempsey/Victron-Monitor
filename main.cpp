@@ -18,6 +18,7 @@
 #include "VictronBLE.h"
 #include "esp_bt.h" // esp_bt_controller_mem_release() - see setup(), frees unused Classic BT RAM
 #include <esp_task_wdt.h> // task watchdog - see setup()/loop(), auto-reboots on a stuck loop()
+#include <esp_log.h> // esp_log_level_set() - see setup(), silences ESP-IDF component logging (WiFi/BLE/lwIP)
 #include "secrets.h" // WIFI_SSID/PASSWORD, SOLAR_MAC/KEY, SHUNT_MAC/KEY - see secrets.h.example
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -73,6 +74,45 @@ struct {
   bool everSeen = false;
   uint32_t lastSentence = 0;
 } gpsLinkStatus;
+
+// ---------------------------------------------------------------------
+// AIS receiver - a separate network device that broadcasts data over
+// UDP. This board deliberately does nothing with the actual data beyond
+// noticing that packets are arriving - no parsing, no forwarding, just a
+// connectivity indicator (the AIS pill), same idea as the GPS pill but
+// for "is the AIS receiver alive and talking" instead of "are NMEA
+// sentences arriving over the wired GPS UART".
+//
+// UDP broadcast rather than a TCP connection because the receiver only
+// accepts one TCP client at a time - broadcast means this board (and
+// anything else that wants the feed, like OpenCPN) can listen without
+// fighting over that single slot.
+// ---------------------------------------------------------------------
+IPAddress AIS_IP(192, 168, 8, 75); // expected sender - packets from elsewhere on this port are ignored
+const uint16_t AIS_UDP_PORT = 9000;
+WiFiUDP aisUdp;
+
+struct {
+  bool everSeen = false;
+  uint32_t lastByte = 0;
+} aisLinkStatus;
+
+// Non-blocking - parsePacket() returns 0 immediately if nothing's
+// waiting. Just drains whatever's there and discards it - the only
+// thing tracked is *that* a packet arrived, not its content, since the
+// pill only ever needs to answer "is this thing alive".
+void pollAis() {
+  int packetSize = aisUdp.parsePacket();
+  if (packetSize <= 0) return;
+  uint8_t discard[256];
+  while (aisUdp.available() > 0) {
+    int n = aisUdp.read(discard, sizeof(discard));
+    if (n <= 0) break;
+  }
+  if (aisUdp.remoteIP() != AIS_IP) return; // not from the sender we're expecting
+  aisLinkStatus.everSeen = true;
+  aisLinkStatus.lastByte = millis();
+}
 
 // Set from the GPS's own $--RMC sentences so the dashboard can show local
 // time without needing internet/NTP access. Pacific time (with automatic
@@ -655,6 +695,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
   .flow-node .sub { font-size: 0.75rem; color: var(--muted); margin-top: 1px; font-variant-numeric: tabular-nums; }
   .flow-node.solar .amps { color: var(--accent2); }
   .flow-node.load .amps { color: var(--blue); }
+  .flow-node.engine .amps { color: #c084fc; }
   .flow-node.battery.charging .amps { color: var(--accent); }
   .flow-node.battery.discharging .amps { color: var(--bad); }
   .flow-node.battery .dir-arrow { font-size: 0.85rem; margin-right: 2px; }
@@ -706,6 +747,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
 
   <div class="status-bar">
     <span class="status-pill" id="gps-pill">GPS</span>
+    <span class="status-pill" id="ais-pill">AIS</span>
     <span class="status-time" id="gps-time-text">GPS time: no fix</span>
   </div>
 
@@ -715,9 +757,11 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
         <path class="flow-line" d="M60,24 L260,24"/>
         <path class="flow-line" d="M60,24 L160,100"/>
         <path class="flow-line" d="M160,100 L260,24"/>
+        <path class="flow-line" d="M60,100 L160,100"/>
         <path id="dash-solar" class="flow-dash" d="M60,24 L260,24" style="stroke:#ffb020"/>
         <path id="dash-batt"  class="flow-dash" d="M60,24 L160,100" style="stroke:#3ddc84"/>
         <path id="dash-load"  class="flow-dash" d="M160,100 L260,24" style="stroke:#5b9dff"/>
+        <path id="dash-engine" class="flow-dash" d="M60,100 L160,100" style="stroke:#c084fc"/>
       </svg>
 
       <div class="flow-node solar" style="left:18.75%; top:20%;">
@@ -732,6 +776,13 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
         <div class="title">Loads (est.)</div>
         <div class="amps" id="fd-load-amps">&mdash;</div>
         <div class="sub" id="fd-load-sub">&mdash;</div>
+      </div>
+
+      <div class="flow-node engine" style="left:18.75%; top:83.3%;">
+        <div class="icon">&#9881;&#65039;</div>
+        <div class="title">Engine</div>
+        <div class="amps" id="fd-engine-amps">&mdash;</div>
+        <div class="sub" id="fd-engine-sub">&mdash;</div>
       </div>
 
       <div class="flow-node battery" id="fd-batt-node" style="left:50%; top:83.3%;">
@@ -864,6 +915,7 @@ async function refresh() {
     }
 
     setPill("gps-pill", d.gps.valid, d.gps.ageMs);
+    setPill("ais-pill", d.ais.valid, d.ais.ageMs);
     const gpsTimeEl = document.getElementById("gps-time-text");
     gpsTimeEl.textContent = (d.gpsTime.valid && d.gpsTime.ageMs < 15000)
       ? d.gpsTime.text + " PT"
@@ -949,6 +1001,18 @@ async function refresh() {
     const battToLoadA = (battOk && battA < -THRESH) ? -battA : 0;
     setFlow(document.getElementById("dash-load"), battToLoadA > THRESH, battToLoadA, false);
 
+    // Engine (alternator) current - calculated, not measured. If the
+    // battery's being charged with more current than solar alone is
+    // supplying, the extra must be coming from somewhere else - on a
+    // boat, that's the engine's alternator. Only meaningful while
+    // actually charging (battA > 0) and only when both readings are
+    // available, since it's a difference of two other numbers.
+    const engineOk = solarOk && battOk;
+    const engineA = (engineOk && battA > solarA) ? (battA - solarA) : 0;
+    document.getElementById("fd-engine-amps").textContent = engineOk ? engineA.toFixed(2) + " A" : "—";
+    document.getElementById("fd-engine-sub").textContent = engineOk ? (engineA * voltage).toFixed(0) + " W (calc.)" : "need both devices";
+    setFlow(document.getElementById("dash-engine"), engineOk && engineA > THRESH, engineA, false);
+
     const battNode = document.getElementById("fd-batt-node");
     const battArrow = document.getElementById("fd-batt-arrow");
     battNode.classList.remove("charging", "discharging");
@@ -1000,6 +1064,15 @@ setInterval(refresh, 2000);
 )HTML";
 
 void handleRoot() {
+  // Ask the browser not to reuse this connection (HTTP keep-alive) - the
+  // classic ESP32 WebServer library is documented to become unstable when
+  // a single connection gets reused for a very large number of requests
+  // over a long period. NOT forcing the ESP32 side closed too (via
+  // client().stop()) anymore - that call can block waiting on a TCP close
+  // handshake, and since the actual lockup this was meant to fix is still
+  // happening even with this header in place, adding that blocking risk
+  // isn't earning its keep. Investigating further before doing more here.
+  server.sendHeader("Connection", "close");
   server.send_P(200, "text/html", PAGE_HTML);
 }
 
@@ -1054,6 +1127,7 @@ void handleData() {
       "},"
       "\"temps\":{\"valid\":%s,\"ageMs\":%lu,\"cabin1C\":%s,\"cabin2C\":%s,\"outsideC\":%s},"
       "\"gps\":{\"valid\":%s,\"ageMs\":%lu},"
+      "\"ais\":{\"valid\":%s,\"ageMs\":%lu},"
       "\"gpsTime\":{\"valid\":%s,\"ageMs\":%lu,\"text\":\"%s\"},"
       "\"heater\":{\"valid\":%s,\"ageMs\":%lu,\"rateLph\":%.2f,\"todayLiters\":%.3f,\"totalLiters\":%.3f,\"pulses\":%lu,"
         "\"tankValid\":%s,\"tankStale\":%s,\"tankCapacityLiters\":%.1f,"
@@ -1084,6 +1158,8 @@ void handleData() {
     cabin1Str, cabin2Str, outsideStr,
     gpsLinkStatus.everSeen ? "true" : "false",
     (unsigned long)(gpsLinkStatus.everSeen ? now - gpsLinkStatus.lastSentence : 0),
+    aisLinkStatus.everSeen ? "true" : "false",
+    (unsigned long)(aisLinkStatus.everSeen ? now - aisLinkStatus.lastByte : 0),
     gpsTimeValid ? "true" : "false",
     (unsigned long)(gpsTimeValid ? now - gpsTimeLastSet : 0),
     gpsTimeStr,
@@ -1111,10 +1187,28 @@ void handleData() {
   );
 
   (void)len; // buf is null-terminated by snprintf; length arg not needed here
+  // See handleRoot() for why - this is the endpoint that actually matters
+  // most, since it's the one hit every 2s by the dashboard's auto-refresh.
+  server.sendHeader("Connection", "close");
   server.send(200, "application/json", buf);
 }
 
 void setup() {
+  // Suppress logging from the underlying ESP-IDF components themselves
+  // (WiFi driver, Bluedroid/BLE stack, lwIP) - this is a completely
+  // separate system from CORE_DEBUG_LEVEL in platformio.ini, which only
+  // covers Arduino-layer log_e()/log_w() calls. This board runs BLE
+  // scanning and WiFi continuously for hours at a time, and either
+  // subsystem can still write occasional log lines straight to the UART
+  // independent of that setting - given a completely dead lockup was
+  // observed after ~7h with no Serial Monitor attached, and it recovered
+  // the instant a monitor was reattached (with no page reload or power
+  // cycle), an unread, filling UART buffer is still the leading
+  // explanation, and CORE_DEBUG_LEVEL alone evidently wasn't the whole
+  // story. Called before Serial.begin() since it doesn't depend on our
+  // own Serial object being ready - it's IDF's own internal log routing.
+  esp_log_level_set("*", ESP_LOG_NONE);
+
   Serial.begin(115200);
   delay(200);
   Serial.println("\nVictron BLE Monitor starting...");
@@ -1193,6 +1287,11 @@ void setup() {
   Serial.print("Listening for heater/icebox telemetry on UDP:");
   Serial.println(TELEMETRY_UDP_PORT);
 
+  // ---- AIS receiver UDP listener ----
+  aisUdp.begin(AIS_UDP_PORT);
+  Serial.print("Listening for AIS broadcast on UDP:");
+  Serial.println(AIS_UDP_PORT);
+
   // ---- Web server ----
   server.on("/", handleRoot);
   server.on("/data", handleData);
@@ -1257,6 +1356,7 @@ void loop() {
   esp_task_wdt_reset(); // feed the watchdog - must happen every pass through loop()
   victron.loop();
   pumpNmea(gpsSerial, gpsLineBuf, sizeof(gpsLineBuf), gpsLineLen, gpsLinkStatus.everSeen, gpsLinkStatus.lastSentence);
+  pollAis();
   pollTelemetry();
   pollTemps();
   server.handleClient();

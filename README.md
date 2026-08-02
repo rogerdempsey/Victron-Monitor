@@ -12,12 +12,14 @@ their own local dashboard too), plus reads 3 DS18B20 temperature probes
 wired directly to this ESP32 (Cabin1, Cabin2, Outside) — folding all of
 it into the same dashboard.
 
-The dashboard shows a **GPS** pill near the top that turns green when
-NMEA sentences are actively coming in and red when they aren't
-(wiring/level-shifter problems or an out-of-range/no-fix receiver will
-show red). Once the GPS has a fix, the dashboard also shows the current
-date/time in Pacific time, taken straight from the GPS's own clock — no
-internet/NTP needed.
+The dashboard shows **GPS** and **AIS** pills near the top that turn
+green when data is actively coming in and red when it isn't (for GPS:
+wiring/level-shifter problems or an out-of-range/no-fix receiver; for
+AIS: the receiver being offline or unreachable on the network). Once the
+GPS has a fix, the dashboard also shows the current date/time in Pacific
+time, taken straight from the GPS's own clock — no internet/NTP needed.
+The AIS pill is a pure connectivity indicator — this board doesn't parse
+or forward AIS data at all, just notices whether it's arriving.
 
 It also reads NMEA0183 from a wired GPS (4800 baud) and re-broadcasts it
 over Wi-Fi as UDP, so a chartplotter program like **OpenCPN** on a
@@ -129,6 +131,17 @@ It shows all connected devices, auto-refreshing every 2 seconds:
   read from the heater board's own NMEA2000 tank-level PGN).
 - **Icebox**: fridge and crisper compartment temperatures, compressor
   on/off state, and duty cycle.
+
+Above the cards, a small animated flow diagram shows current moving
+between **Solar**, **Battery**, and **Loads** (with an amps/watts
+readout under each), plus a fourth node, **Engine** — this one's
+calculated, not measured. Whenever the shunt's charging current is
+higher than what solar alone is providing, the difference is attributed
+to the engine's alternator, and its flow line only ever goes to the
+battery (it doesn't feed loads or interact with solar directly in the
+diagram). Like the Loads estimate, it needs both the shunt and solar
+charger reporting live data to compute anything, and shows "need both
+devices" otherwise.
 
 A status dot next to each device name turns green when data is fresh and
 red if it hasn't updated in the last 15 seconds (e.g. out of BLE range,
@@ -258,6 +271,28 @@ for troubleshooting:
   despite everything looking fine on both ends, that setting is worth
   checking and temporarily disabling to test.
 
+## How the AIS receiver connects
+
+A separate network AIS receiver (`192.168.8.75`) broadcasts NMEA data
+over UDP on port **9000**, and this board just listens for it, the same
+way it listens for heater/icebox telemetry. It's UDP *broadcast* rather
+than a direct connection specifically because the receiver only accepts
+one TCP client at a time — broadcasting means this board and anything
+else that wants the feed (OpenCPN, a chartplotter app, etc.) can listen
+simultaneously without fighting over that single slot.
+
+This board deliberately does nothing with the actual AIS data - no
+parsing, no forwarding, no re-broadcasting alongside the GPS feed. All
+it does is notice that packets are arriving from the expected sender IP
+and drive the AIS pill from that, exactly like the GPS pill but for "is
+the receiver alive and talking" rather than "are NMEA sentences arriving
+over the wired GPS UART." If you want the actual AIS data itself (ship
+positions, etc.) for a chartplotter, point that program directly at the
+receiver's broadcast — this board isn't in that path at all.
+
+If the AIS receiver's broadcast address or port ever changes, update
+`AIS_IP`/`AIS_UDP_PORT` near the top of `src/main.cpp` to match.
+
 ## Connecting OpenCPN
 
 The ESP32 broadcasts every GPS sentence it receives, untouched,
@@ -306,19 +341,46 @@ something's wrong and power-cycle it:
   reserves RAM for Classic BT by default regardless. That memory gets
   released back to the heap at boot, which matters a lot on a board this
   tight on RAM.
-- **Internal core debug logging disabled** (`CORE_DEBUG_LEVEL=0` in
-  `platformio.ini`): the ESP32 Arduino core logs certain internal events
-  (like a dropped web server connection) straight to the same UART used
-  for the Serial Monitor. If nothing's actively reading that UART (no
-  Serial Monitor attached), and enough of these build up, the write can
-  *block* until there's room - and since that can happen from inside the
-  web server's own connection handling, a blocked log write stalls the
-  whole dashboard along with it. This was the actual cause of a
-  "sluggish unless I have the Serial Monitor open" pattern that looked
-  for a while like it might be a memory leak. Turning this logging off
-  entirely removes the only thing that could ever queue up and block a
-  UART write during normal operation, so this shouldn't need a Serial
-  Monitor attached to run smoothly.
+- **Internal logging disabled, at two separate layers**: the ESP32
+  Arduino core logs certain internal events (like a dropped web server
+  connection) straight to the same UART used for the Serial Monitor. If
+  nothing's actively reading that UART (no Serial Monitor attached), and
+  enough of these build up, the write can *block* until there's room -
+  and since that can happen from inside the web server's own connection
+  handling, a blocked log write stalls the whole dashboard along with
+  it. This turned out to have two independent sources, not one:
+  - `CORE_DEBUG_LEVEL=0` in `platformio.ini` covers the *Arduino-layer*
+    logging (`log_e()`/`log_w()` calls, e.g. in `NetworkClient.cpp`).
+  - `esp_log_level_set("*", ESP_LOG_NONE)`, called first thing in
+    `setup()`, covers the *separate* ESP-IDF component logging
+    underneath it - the WiFi driver, the Bluedroid/BLE stack, lwIP -
+    none of which `CORE_DEBUG_LEVEL` touches at all.
+
+  The first of these alone looked like it had fixed a "sluggish unless I
+  have the Serial Monitor open" pattern (that had looked for a while
+  like it might be a memory leak) - but a full lockup requiring a manual
+  power cycle after several hours unmonitored turned out to still be
+  happening, and only cleared the moment a Serial Monitor was reattached
+  (with no page reload or power cycle), pointing at the same class of
+  problem from the *other* logging source. Both are now off, which
+  should mean nothing can queue up and block a UART write during normal
+  operation regardless of which subsystem it would have come from - but
+  given the first fix alone looked sufficient too until it wasn't, this
+  is worth treating as the strongest lead so far rather than a
+  guaranteed resolution until it's held up over a long unmonitored run.
+- **Every web response asks the browser not to keep the connection
+  alive** (`Connection: close`): the classic ESP32 `WebServer` library
+  is documented to become unstable when a single HTTP connection gets
+  reused for a very large number of requests over a long stretch -
+  potentially relevant given the dashboard re-fetches `/data` every 2
+  seconds, which could mean thousands of requests on one reused
+  connection if a browser tab is left open for many hours. An earlier
+  version of this fix also forced the ESP32 side of the connection
+  closed after every response (`server.client().stop()`), but that call
+  can itself block waiting on a TCP close handshake, and since the
+  lockup this was meant to prevent was still happening with it in place,
+  it was removed again rather than keep unproven blocking risk in a hot
+  path - the logging fixes above are the more likely actual cause.
 
 **Reading the heap footer**: the dashboard footer shows uptime, free
 heap at boot, free heap right now, and the largest allocatable block.
@@ -367,6 +429,23 @@ tracking down a root cause than the reboot alone.
 - **Can't reach the web page**: confirm the ESP32's static IP didn't
   conflict with another device, and that your computer/phone is on the
   same network/subnet.
+- **Dashboard fully locks up after many hours, needs a power cycle**:
+  see the logging bullet under **Reliability** above - if it's still
+  happening after that fix, the fact that a plain reboot is needed
+  (rather than it recovering on its own, which the task watchdog should
+  otherwise cause within 20s of a stuck loop) is itself an important
+  clue that whatever's wrong isn't a simple stuck `loop()`. The most
+  useful next step is capturing what actually happens at the moment of
+  lockup, since guessing from symptoms alone has a real limit: run
+  `pio device monitor --filter log2file --filter time` and leave it
+  attached for as long as it takes to reproduce. A Guru Meditation/panic
+  dump (not gated by any of the logging settings above - it's printed
+  directly by the crash handler) would point at the exact function that
+  faulted; a `task_wdt` block would mean the watchdog *did* fire but
+  something about recovery afterward is failing; silence in the log
+  right up to the lockup would point at something outside this board's
+  own main loop entirely, most likely the WiFi/lwIP stack's own internal
+  task, which isn't covered by the watchdog.
 - **Heater or icebox card stuck on "no data"**: since these now push
   their data here (see **How the heater and icebox boards connect**
   above) rather than being polled, check that the *other* board is
@@ -390,6 +469,12 @@ tracking down a root cause than the reboot alone.
 - **Garbled NMEA sentences**: almost always a baud rate mismatch or a
   bad/missing level-shift — confirm the GPS is really running at 4800
   baud (check its manual).
+- **AIS pill stays red**: confirm the AIS receiver is actually powered
+  up and configured for UDP broadcast mode (not TCP server mode) on port
+  9000, broadcasting to the subnet (`192.168.8.255`) rather than a
+  specific unicast target. Also check for a "client/AP isolation"
+  setting on your router, same as the heater/icebox troubleshooting
+  above — it blocks broadcast traffic too, not just unicast.
 
 ## Project structure
 
@@ -401,6 +486,6 @@ victron-monitor/
 │   ├── secrets.h.example  # Template - copy to secrets.h and fill in
 │   └── secrets.h          # Your real Wi-Fi/Victron credentials (gitignored)
 ├── src/
-│   └── main.cpp        # WiFi + BLE scanning + heater/icebox UDP telemetry + temp probes + web dashboard + NMEA0183 UDP gateway
+│   └── main.cpp        # WiFi + BLE scanning + heater/icebox/AIS UDP listening + temp probes + web dashboard + NMEA0183 UDP gateway
 └── README.md
 ```
