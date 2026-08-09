@@ -40,79 +40,38 @@ IPAddress secondaryDNS(8, 8, 8, 8);
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
-// NMEA0183 GPS input -> UDP broadcast for OpenCPN
+// GPS + AIS, both arriving as a single NMEA0183-over-UDP feed on the
+// same well-known port - no wired GPS receiver anymore, and no separate
+// dedicated AIS listener on its own port. This board is a pure
+// listener now: it never sends anything on this port (no more
+// re-broadcasting for OpenCPN - since the upstream source already
+// broadcasts to the whole subnet, anything that wants this feed,
+// OpenCPN included, can listen to that same broadcast directly without
+// this board needing to relay it).
 //
-// IMPORTANT: GPS receivers wired at 12V put out RS-422-level (or at
-// least non-3.3V-safe) NMEA0183 signals on their data lines. NEVER wire
-// those lines straight into these GPIOs - you need a level
-// shifter/opto-isolator between the receiver and the ESP32 first (see
-// README for the circuit). These GPIOs should only ever see clean
-// 3.3V TTL out of that converter.
-//
-// GPIO34 is used because it's an input-only pin on the ESP32 -
-// a good fit since the feed is receive-only from the ESP32's side,
-// and it keeps this off any strapping/BLE-sensitive pins.
+// GPS ($-prefixed) and AIS (!-prefixed) sentences are told apart by
+// their first character. GPS sentences additionally get parsed for
+// time/position (maybeUpdateGpsTime()/maybeUpdateGpsPosition() below);
+// AIS sentences only ever drive the AIS pill - no parsing, same as
+// before.
 // ---------------------------------------------------------------------
-#define GPS_RX_PIN     34
-#define GPS_BAUD       4800
+#define NAV_UDP_PORT 10110
+WiFiUDP navUdp;
+char navBuf[512];
 
-// Port OpenCPN listens on. In OpenCPN: Options -> Connections -> Add ->
-// Network -> Protocol: UDP -> Address: 0.0.0.0 -> Port: (match below).
-#define NMEA_UDP_PORT  10110
-
-HardwareSerial gpsSerial(1);
-WiFiUDP nmeaUdp;
-IPAddress nmeaBroadcastIP;
-// Fixed buffer, not a String - see pumpNmea() below for why.
-char gpsLineBuf[128];
-size_t gpsLineLen = 0;
-
-// Tracks whether the NMEA0183 input is actively receiving sentences (i.e.
-// the wiring/level-shifter is good and the receiver is talking), separate
-// from whether the GPS currently has a satellite fix.
+// Tracks whether GPS sentences are actively arriving, separate from
+// whether the GPS currently has a satellite fix.
 struct {
   bool everSeen = false;
   uint32_t lastSentence = 0;
 } gpsLinkStatus;
 
-// ---------------------------------------------------------------------
-// AIS receiver - a separate network device that broadcasts data over
-// UDP. This board deliberately does nothing with the actual data beyond
-// noticing that packets are arriving - no parsing, no forwarding, just a
-// connectivity indicator (the AIS pill), same idea as the GPS pill but
-// for "is the AIS receiver alive and talking" instead of "are NMEA
-// sentences arriving over the wired GPS UART".
-//
-// UDP broadcast rather than a TCP connection because the receiver only
-// accepts one TCP client at a time - broadcast means this board (and
-// anything else that wants the feed, like OpenCPN) can listen without
-// fighting over that single slot.
-// ---------------------------------------------------------------------
-IPAddress AIS_IP(192, 168, 8, 75); // expected sender - packets from elsewhere on this port are ignored
-const uint16_t AIS_UDP_PORT = 9000;
-WiFiUDP aisUdp;
-
+// Tracks whether AIS sentences are actively arriving - no data from
+// them is ever parsed or kept, this is purely a connectivity indicator.
 struct {
   bool everSeen = false;
   uint32_t lastByte = 0;
 } aisLinkStatus;
-
-// Non-blocking - parsePacket() returns 0 immediately if nothing's
-// waiting. Just drains whatever's there and discards it - the only
-// thing tracked is *that* a packet arrived, not its content, since the
-// pill only ever needs to answer "is this thing alive".
-void pollAis() {
-  int packetSize = aisUdp.parsePacket();
-  if (packetSize <= 0) return;
-  uint8_t discard[256];
-  while (aisUdp.available() > 0) {
-    int n = aisUdp.read(discard, sizeof(discard));
-    if (n <= 0) break;
-  }
-  if (aisUdp.remoteIP() != AIS_IP) return; // not from the sender we're expecting
-  aisLinkStatus.everSeen = true;
-  aisLinkStatus.lastByte = millis();
-}
 
 // Set from the GPS's own $--RMC sentences so the dashboard can show local
 // time without needing internet/NTP access. Pacific time (with automatic
@@ -231,56 +190,35 @@ void maybeUpdateGpsPosition(const String &line) {
   gpsFix.lastUpdate = millis();
 }
 
-// Computes the subnet broadcast address (e.g. 192.168.8.255) from our
-// static IP + subnet mask, so UDP packets reach every listener on the
-// LAN without needing to know OpenCPN's specific IP.
-IPAddress calculateBroadcast(IPAddress ip, IPAddress mask) {
-  IPAddress bcast;
-  for (int i = 0; i < 4; i++) {
-    bcast[i] = ip[i] | (~mask[i] & 0xFF);
-  }
-  return bcast;
-}
+// Non-blocking - parsePacket() returns 0 immediately if nothing's
+// waiting. A single UDP packet may contain more than one sentence
+// batched together (some NMEA multiplexers do this), so this splits on
+// line endings and handles each one found. GPS sentences get parsed for
+// time/position; AIS sentences only ever update the pill.
+void pollNav() {
+  int packetSize = navUdp.parsePacket();
+  if (packetSize <= 0) return;
+  int len = navUdp.read(navBuf, sizeof(navBuf) - 1);
+  if (len <= 0) return;
+  navBuf[len] = '\0';
 
-// Reads whatever bytes are available from the GPS UART, assembles
-// them into lines, and forwards each complete NMEA0183 sentence
-// ($GPGGA... etc.) untouched over UDP as soon as it's terminated.
-// Sentences are passed through byte-for-byte (no re-parsing/checksum
-// recalculation) so OpenCPN sees exactly what the receiver sent.
-//
-// Accumulates into a fixed char buffer rather than an Arduino String.
-// The old code did `lineBuf += c` for every single incoming byte, which
-// on Arduino's String class means a heap alloc/copy/free on essentially
-// every byte - at the GPS's 4800 baud that's hundreds of tiny heap
-// operations per second, running non-stop, which fragments the ESP32's
-// heap badly over hours/days of uptime. That's the most likely cause of
-// the board getting sluggish the longer it's been running. Now a String
-// is only built once per *complete* sentence (a few times a second),
-// just to hand off to the existing helpers below that expect one.
-void pumpNmea(HardwareSerial &port, char *lineBuf, size_t lineBufCap, size_t &lineLen,
-              bool &everSeen, uint32_t &lastSentence) {
-  while (port.available()) {
-    char c = (char)port.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (lineLen > 1 && (lineBuf[0] == '$' || lineBuf[0] == '!')) {
-        everSeen = true;
-        lastSentence = millis();
-        lineBuf[lineLen] = '\0';
-        String sentence(lineBuf); // one alloc per complete sentence, not per byte
+  uint32_t now = millis();
+  char *line = strtok(navBuf, "\r\n");
+  while (line != nullptr) {
+    size_t lineLen = strlen(line);
+    if (lineLen > 1) {
+      if (line[0] == '$') {
+        gpsLinkStatus.everSeen = true;
+        gpsLinkStatus.lastSentence = now;
+        String sentence(line);
         maybeUpdateGpsTime(sentence);
         maybeUpdateGpsPosition(sentence);
-        nmeaUdp.beginPacket(nmeaBroadcastIP, NMEA_UDP_PORT);
-        nmeaUdp.write((const uint8_t*)lineBuf, lineLen);
-        nmeaUdp.write((const uint8_t*)"\r\n", 2);
-        nmeaUdp.endPacket();
+      } else if (line[0] == '!') {
+        aisLinkStatus.everSeen = true;
+        aisLinkStatus.lastByte = now;
       }
-      lineLen = 0;
-    } else if (lineLen >= lineBufCap - 1) {
-      lineLen = 0; // discard noise/garbage line (overflow), same as before
-    } else {
-      lineBuf[lineLen++] = c;
     }
+    line = strtok(nullptr, "\r\n");
   }
 }
 
@@ -363,7 +301,7 @@ double solarMaxCurrentLast10h(uint32_t now) {
 
 // ---------------------------------------------------------------------
 // Diesel heater fuel-flow, pushed here over UDP by the standalone
-// CDHeater ESP32 instead of this board polling it over HTTP. CDHeater
+// Heater ESP32 instead of this board polling it over HTTP. Heater
 // broadcasts a small JSON payload every ~2s (see its own firmware);
 // this board just listens and updates whenever a packet arrives, the
 // same fire-and-forget pattern already used for the GPS/NMEA UDP
@@ -391,11 +329,11 @@ struct {
   double todayLiters = 0;
   double totalLiters = 0;
   uint32_t pulses = 0;
-  // NMEA2000 fuel tank level, as relayed by CDHeater's /data endpoint
-  // (CDHeater itself listens for PGN 127505 on the boat's N2K bus - see
+  // NMEA2000 fuel tank level, as relayed by Heater's /data endpoint
+  // (Heater itself listens for PGN 127505 on the boat's N2K bus - see
   // diesel_heater_pulse_monitor.ino - this board just reads its JSON).
-  bool tankSeen = false;   // has CDHeater ever seen a tank PGN since its own boot?
-  bool tankStale = false;  // CDHeater's own staleness flag (no PGN in >30s)
+  bool tankSeen = false;   // has Heater ever seen a tank PGN since its own boot?
+  bool tankStale = false;  // Heater's own staleness flag (no PGN in >30s)
   double tankPct = -1;     // % full, -1 = no reading
   double tankCapacityLiters = -1;
 } heaterLatest;
@@ -463,7 +401,7 @@ double tankLevelMaxLast1h(uint32_t now) {
 }
 
 // Pulls the numeric value following "key": out of a small JSON blob.
-// Good enough for the flat, fixed-key JSON CDHeater's /data returns;
+// Good enough for the flat, fixed-key JSON Heater's /data returns;
 // not a general-purpose parser.
 //
 // Searches the raw C string with strstr() instead of String::indexOf()
@@ -527,7 +465,7 @@ void pollTelemetry() {
     heaterLatest.valid = true;
 
     // Only feed fresh, real N2K readings into the 1-hour max - a stale
-    // (frozen) value from CDHeater shouldn't get counted as a new sample.
+    // (frozen) value from Heater shouldn't get counted as a new sample.
     if (heaterLatest.tankSeen && !heaterLatest.tankStale) {
       recordTankLevelSample(heaterLatest.tankPct, heaterLatest.lastUpdate);
     }
@@ -958,7 +896,7 @@ async function refresh() {
       if (!d.heater.tankValid || d.heater.tankMaxPct1h === null) {
         tankPctEl.textContent = "no data";
       } else {
-        // "stale" here describes CDHeater's *current* live reading (its N2K
+        // "stale" here describes Heater's *current* live reading (its N2K
         // bus has gone quiet), not the 1h-max figure itself, which is still
         // a real value seen sometime in the last hour - flag it so it's
         // clear the number may not reflect what's happening right now.
@@ -1086,7 +1024,7 @@ void handleData() {
 
   // JSON null (not a quoted string) when there's no reading yet, so the
   // dashboard's `=== null` check works the same way it does for
-  // hours_remaining on the CDHeater board itself.
+  // hours_remaining on the Heater board itself.
   char tankMaxPctStr[16] = "null";
   if (tankMaxValid) snprintf(tankMaxPctStr, sizeof(tankMaxPctStr), "%.1f", tankMaxPct);
 
@@ -1193,6 +1131,42 @@ void handleData() {
   server.send(200, "application/json", buf);
 }
 
+// ---- WiFi reliability ----
+// The boot-time connect timeout below only covers getting onto WiFi in
+// the first place. If it drops during normal operation, there was
+// previously no way out other than someone noticing the dashboard had
+// gone stale and power-cycling it. This actively retries a reconnect,
+// and does a full reboot as a last resort if it's been down too long
+// for a plain reconnect to be working - same pattern already applied to
+// the heater and icebox boards.
+uint32_t wifiDownSince = 0;      // 0 = currently connected
+uint32_t lastReconnectAttempt = 0;
+const uint32_t WIFI_RECONNECT_RETRY_MS = 15000UL;  // don't hammer reconnect() more often than this
+const uint32_t WIFI_FORCE_RESTART_MS   = 180000UL; // 3 min continuously down -> full reboot
+
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDownSince = 0;
+    return;
+  }
+  uint32_t now = millis();
+  if (wifiDownSince == 0) {
+    wifiDownSince = now;
+    Serial.println("WiFi dropped - will attempt to reconnect");
+  }
+  if (now - wifiDownSince > WIFI_FORCE_RESTART_MS) {
+    Serial.println("WiFi down for 3+ minutes - restarting");
+    delay(200); // let the Serial line flush before reset
+    ESP.restart();
+  }
+  if (now - lastReconnectAttempt > WIFI_RECONNECT_RETRY_MS) {
+    lastReconnectAttempt = now;
+    Serial.println("Attempting WiFi reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+}
+
 void setup() {
   // Suppress logging from the underlying ESP-IDF components themselves
   // (WiFi driver, Bluedroid/BLE stack, lwIP) - this is a completely
@@ -1209,6 +1183,13 @@ void setup() {
   // own Serial object being ready - it's IDF's own internal log routing.
   esp_log_level_set("*", ESP_LOG_NONE);
 
+  // Larger-than-default TX buffer for extra headroom, in case anything
+  // ever needs to queue more Serial output than usual during loop() -
+  // both logging layers are already suppressed above and this board's
+  // own Serial.print calls are all confined to setup(), so this is
+  // margin rather than a fix for a specific known problem. Must be
+  // called before begin().
+  Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(200);
   Serial.println("\nVictron BLE Monitor starting...");
@@ -1273,24 +1254,15 @@ void setup() {
   victron.addDevice("Solar Charger", SOLAR_MAC, SOLAR_KEY, DEVICE_TYPE_SOLAR_CHARGER);
   victron.addDevice("Battery Shunt", SHUNT_MAC, SHUNT_KEY, DEVICE_TYPE_BATTERY_MONITOR);
 
-  // ---- GPS NMEA0183 -> UDP broadcast ----
-  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);   // RX only, no TX pin
-  nmeaBroadcastIP = calculateBroadcast(local_IP, subnet);
-  nmeaUdp.begin(0); // ephemeral local port; we only ever send
-  Serial.print("NMEA0183 UDP broadcast -> ");
-  Serial.print(nmeaBroadcastIP);
-  Serial.print(":");
-  Serial.println(NMEA_UDP_PORT);
+  // ---- GPS + AIS UDP listener ----
+  navUdp.begin(NAV_UDP_PORT);
+  Serial.print("Listening for GPS/AIS on UDP:");
+  Serial.println(NAV_UDP_PORT);
 
   // ---- Heater + icebox telemetry UDP listener ----
   telemetryUdp.begin(TELEMETRY_UDP_PORT);
   Serial.print("Listening for heater/icebox telemetry on UDP:");
   Serial.println(TELEMETRY_UDP_PORT);
-
-  // ---- AIS receiver UDP listener ----
-  aisUdp.begin(AIS_UDP_PORT);
-  Serial.print("Listening for AIS broadcast on UDP:");
-  Serial.println(AIS_UDP_PORT);
 
   // ---- Web server ----
   server.on("/", handleRoot);
@@ -1354,9 +1326,17 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset(); // feed the watchdog - must happen every pass through loop()
+  maintainWiFi();
+
+  // GPS/AIS goes first, ahead of everything else - UDP packets are
+  // buffered by the network stack regardless of what loop() is doing,
+  // so nothing's ever lost, but running this first means GPS sentences
+  // get parsed (time/position, and the pill) without waiting on BLE
+  // scanning or anything else to finish first, keeping position/time
+  // data as close to real-time as this architecture allows.
+  pollNav();
+
   victron.loop();
-  pumpNmea(gpsSerial, gpsLineBuf, sizeof(gpsLineBuf), gpsLineLen, gpsLinkStatus.everSeen, gpsLinkStatus.lastSentence);
-  pollAis();
   pollTelemetry();
   pollTemps();
   server.handleClient();

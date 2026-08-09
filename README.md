@@ -1,4 +1,4 @@
-# Victron BLE Monitor + NMEA0183 Wi-Fi Gateway (ESP32)
+# Victron BLE Monitor + Boat Systems Dashboard (ESP32)
 
 Reads live data from a Victron battery shunt (SmartShunt / BMV) and a
 SmartSolar/BlueSolar MPPT controller over Bluetooth Low Energy "Instant
@@ -13,17 +13,16 @@ wired directly to this ESP32 (Cabin1, Cabin2, Outside) — folding all of
 it into the same dashboard.
 
 The dashboard shows **GPS** and **AIS** pills near the top that turn
-green when data is actively coming in and red when it isn't (for GPS:
-wiring/level-shifter problems or an out-of-range/no-fix receiver; for
-AIS: the receiver being offline or unreachable on the network). Once the
-GPS has a fix, the dashboard also shows the current date/time in Pacific
-time, taken straight from the GPS's own clock — no internet/NTP needed.
-The AIS pill is a pure connectivity indicator — this board doesn't parse
-or forward AIS data at all, just notices whether it's arriving.
-
-It also reads NMEA0183 from a wired GPS (4800 baud) and re-broadcasts it
-over Wi-Fi as UDP, so a chartplotter program like **OpenCPN** on a
-laptop/tablet on the same network gets GPS position wirelessly.
+green when data is actively coming in and red when it isn't. Both are
+pure listeners: this board doesn't have a wired GPS receiver and doesn't
+broadcast anything itself — it listens for an existing NMEA0183-over-UDP
+feed (GPS and AIS sentences together, from whatever upstream source is
+already broadcasting them on the network) on port **10110**, the same
+feed any chartplotter software like OpenCPN would listen to directly.
+GPS sentences get parsed just enough to show local time (Pacific, with
+automatic PST/PDT handling) straight from the GPS's own clock — no
+internet/NTP needed. AIS sentences are never parsed at all, just noticed
+— the AIS pill is a pure connectivity indicator.
 
 The board is set up to recover on its own from most common failures
 (stuck Wi-Fi connect, a genuinely wedged main loop) rather than needing
@@ -154,66 +153,6 @@ snapshot: free heap at boot, free heap right now, and the largest
 allocatable block. These matter for spotting trouble before it causes a
 slowdown or crash — see **Reliability** below for what to watch for.
 
-## GPS wiring (read this before connecting anything)
-
-Your GPS receiver is a 12V-powered device, which almost always means its
-NMEA0183 **data** lines are RS-422 level (or otherwise not 3.3V-safe) —
-this is separate from its 12V power input. **Never wire a GPS NMEA-out
-line directly into an ESP32 GPIO.** RS-422 signal swings and the ESP32's
-3.3V-only, not-5V-tolerant GPIOs are not compatible, and at best you'll
-get garbage data, at worst you'll damage the pin or the whole board.
-
-You need a small NMEA0183-to-TTL converter between the receiver and the
-ESP32. Two easy options:
-
-1. **Buy one.** Cheap opto-isolated "NMEA0183 to TTL/RS232" converter
-   boards are widely available (search that term) and are the least
-   fuss — wire receiver NMEA+/NMEA- into the converter, converter's TTL
-   output into the ESP32 GPIO, done.
-2. **Build one.** The classic hobbyist circuit uses a single
-   optocoupler (e.g. 6N137 or PC817): NMEA+ through a current-
-   limiting resistor (~1-2.2k for 12V lines) into the opto's LED anode,
-   NMEA- to the LED cathode, and the opto's output transistor pulls the
-   ESP32 GPIO (with a pull-up to 3.3V) low/high in step with the signal.
-   This also electrically isolates the ESP32 from the receiver, which is
-   good practice on a boat's DC electrical system anyway.
-
-### 6N137 wiring
-
-If you're using a 6N137 DIP-8 optocoupler, this is the pin-to-pin wiring:
-
-| 6N137 pin | Function  | Wire it to |
-|-----------|-----------|------------|
-| 1         | Anode     | NMEA+, through a 1-2.2kΩ resistor |
-| 2         | Cathode   | NMEA- |
-| 4         | GND       | ESP32 GND (output-side ground) |
-| 6         | Vo (out)  | ESP32 GPIO34, plus a 10kΩ pull-up to 3.3V |
-| 7         | Enable    | tie to GND (output-side) so the chip is always enabled |
-| 8         | Vcc       | ESP32 3.3V |
-
-A 0.1µF ceramic capacitor across pins 8 and 4, right at the chip, is cheap
-insurance against noise on the output side. Never let the 12V-side pins
-(1, 2) share a ground with the 3.3V-side pins (4, 6, 7, 8) — the whole
-point of the optocoupler is to keep those two grounds electrically
-separate.
-
-Only the **clean 3.3V TTL output of that converter** should land on the
-ESP32 pin below. Power the GPS receiver itself from your 12V system as
-normal — that's unrelated to the signal-level problem above.
-
-| Signal              | ESP32 pin | Baud  | Notes                          |
-|---------------------|-----------|-------|---------------------------------|
-| GPS NMEA0183 (via converter) | GPIO34 | 4800  | Input-only pin, receive-only |
-
-GPIO34 is used deliberately: it's an input-only pin on the ESP32, which
-suits GPS since the ESP32 never needs to transmit back to it, and it
-avoids any of the strapping/boot-sensitive pins.
-
-If your particular GPS unit's documentation says its NMEA output is
-already TTL-level (some smaller/cheaper units are), you can skip the
-converter — but check the datasheet/manual to be sure rather than
-assuming, since guessing wrong risks the ESP32.
-
 ## Temperature probe wiring (Cabin1 / Cabin2 / Outside)
 
 All 3 DS18B20 probes share a single wire on **ESP32 GPIO4**. Unlike the
@@ -271,33 +210,44 @@ for troubleshooting:
   despite everything looking fine on both ends, that setting is worth
   checking and temporarily disabling to test.
 
-## How the AIS receiver connects
+## How GPS and AIS reach this board
 
-A separate network AIS receiver (`192.168.8.75`) broadcasts NMEA data
-over UDP on port **9000**, and this board just listens for it, the same
-way it listens for heater/icebox telemetry. It's UDP *broadcast* rather
-than a direct connection specifically because the receiver only accepts
-one TCP client at a time — broadcasting means this board and anything
-else that wants the feed (OpenCPN, a chartplotter app, etc.) can listen
-simultaneously without fighting over that single slot.
+This board has no wired GPS receiver and doesn't originate or
+re-broadcast anything itself — it's a pure listener for an existing
+NMEA0183-over-UDP feed on port **10110**, the standard port for this
+purpose. Both GPS sentences (`$...`) and AIS sentences (`!...`) are
+expected on the same feed, told apart by that first character, which is
+a standard NMEA0183 convention:
 
-This board deliberately does nothing with the actual AIS data - no
-parsing, no forwarding, no re-broadcasting alongside the GPS feed. All
-it does is notice that packets are arriving from the expected sender IP
-and drive the AIS pill from that, exactly like the GPS pill but for "is
-the receiver alive and talking" rather than "are NMEA sentences arriving
-over the wired GPS UART." If you want the actual AIS data itself (ship
-positions, etc.) for a chartplotter, point that program directly at the
-receiver's broadcast — this board isn't in that path at all.
+- GPS sentences get parsed just enough to pull out local time (from
+  `$--RMC`) for the dashboard's clock, and drive the GPS pill.
+- AIS sentences are never parsed — only noticed, purely to drive the AIS
+  pill.
 
-If the AIS receiver's broadcast address or port ever changes, update
-`AIS_IP`/`AIS_UDP_PORT` near the top of `src/main.cpp` to match.
+A single UDP packet can contain more than one sentence batched together
+(some NMEA multiplexers/AIS receivers do this); that's handled
+automatically.
+
+Since this is a broadcast this board only listens to, whatever upstream
+device is actually generating that feed (a GPS receiver already
+configured for UDP broadcast, an AIS receiver in broadcast mode, a
+multiplexer combining both, SignalK, etc.) needs to be broadcasting to
+the subnet on port 10110 independently of this board — nothing here
+causes that feed to exist. If you're setting up an upstream source for
+the first time, see **Connecting OpenCPN** below, which also applies to
+getting data flowing into this board in the first place, since both are
+just listeners on the same broadcast.
+
+If the port ever needs to change, `NAV_UDP_PORT` near the top of
+`src/main.cpp` is the only place it's defined.
 
 ## Connecting OpenCPN
 
-The ESP32 broadcasts every GPS sentence it receives, untouched,
-as a UDP broadcast on port **10110** (the common default for NMEA0183
-over IP). In OpenCPN:
+This board and OpenCPN are both just listeners on the same NMEA0183-over-
+UDP broadcast now — there's no longer a "connect OpenCPN to this board"
+step, since this board doesn't originate or relay anything. Point OpenCPN
+at whatever's actually broadcasting the GPS/AIS feed on your network,
+the same way this board listens to it:
 
 1. **Options -> Connections -> Add Connection**
 2. Type: **Network**
@@ -311,12 +261,9 @@ over IP). In OpenCPN:
 
 Any other program on the same Wi-Fi network that listens for NMEA0183
 UDP broadcasts on port 10110 (nav apps on a phone/tablet, SignalK, etc.)
-will pick up the same feed simultaneously — that's the advantage of
-broadcast over a direct connection.
-
-If you ever need to change the port or move to a direct (non-broadcast)
-connection, both `NMEA_UDP_PORT` and the broadcast-address calculation
-are near the top of `src/main.cpp`.
+picks up the same feed simultaneously, this board included — that's the
+advantage of a shared broadcast over each program needing its own direct
+connection to the source.
 
 ## Reliability
 
@@ -460,21 +407,21 @@ tracking down a root cause than the reboot alone.
   probe's DATA line is wired to GPIO4. Check the Serial Monitor at boot
   — it prints how many probes it found vs. the expected 3, plus each
   found probe's address.
-- **No GPS data in OpenCPN**: double-check the level-converter wiring
-  first (garbled or absent data on the Serial Monitor at boot is the
-  usual sign of a wiring/level problem, not a software one). Also
-  confirm OpenCPN's UDP port matches `NMEA_UDP_PORT` (10110 by default)
-  and that nothing else on the network (e.g. a firewall) is blocking UDP
-  broadcasts.
-- **Garbled NMEA sentences**: almost always a baud rate mismatch or a
-  bad/missing level-shift — confirm the GPS is really running at 4800
-  baud (check its manual).
-- **AIS pill stays red**: confirm the AIS receiver is actually powered
-  up and configured for UDP broadcast mode (not TCP server mode) on port
-  9000, broadcasting to the subnet (`192.168.8.255`) rather than a
-  specific unicast target. Also check for a "client/AP isolation"
+- **GPS or AIS pill stays red**: confirm whatever's actually broadcasting
+  the NMEA0183/AIS feed on your network is powered up and genuinely
+  broadcasting (to the subnet, e.g. `192.168.8.255`) on port **10110**,
+  not sending to one specific unicast target. Check that OpenCPN (or
+  whatever else consumes the feed) is also seeing it — if OpenCPN's
+  blind too, the problem is upstream of this board entirely, not
+  something to chase here. Also check for a "client/AP isolation"
   setting on your router, same as the heater/icebox troubleshooting
   above — it blocks broadcast traffic too, not just unicast.
+- **GPS pill is green but no time shows on the dashboard**: the pill only
+  means *some* `$`-prefixed sentence arrived recently — the clock
+  specifically needs a `$--RMC` sentence with a valid fix. Confirm
+  whatever's generating the feed actually includes RMC (not just GGA or
+  other sentence types) and that the GPS itself has an actual satellite
+  fix.
 
 ## Project structure
 
@@ -486,6 +433,6 @@ victron-monitor/
 │   ├── secrets.h.example  # Template - copy to secrets.h and fill in
 │   └── secrets.h          # Your real Wi-Fi/Victron credentials (gitignored)
 ├── src/
-│   └── main.cpp        # WiFi + BLE scanning + heater/icebox/AIS UDP listening + temp probes + web dashboard + NMEA0183 UDP gateway
+│   └── main.cpp        # WiFi + BLE scanning + GPS/AIS UDP listening + heater/icebox telemetry + temp probes + web dashboard
 └── README.md
 ```
