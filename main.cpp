@@ -30,13 +30,19 @@ const char* DEVICE_HOSTNAME = "VictronGPS";
 // >>> EDIT secrets.h, not this file - see secrets.h.example <<<
 // ---------------------------------------------------------------------
 
-// Static IP configuration. Adjust gateway/subnet if your router uses a
-// different range (check your router's admin page if unsure).
-IPAddress local_IP(192, 168, 8, 66);
-IPAddress gateway(192, 168, 8, 1);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress primaryDNS(192, 168, 8, 1);
-IPAddress secondaryDNS(8, 8, 8, 8);
+// This board uses plain DHCP - no on-device static IP config. It's still
+// expected to always come up at 192.168.8.66 (every other board's
+// DASHBOARD_IP/heater/icebox telemetry target that address directly),
+// but that's now handled by a DHCP reservation on the router, tied to
+// this board's MAC address, rather than being configured here. This is
+// a deliberate tradeoff: DHCP means the hostname actually reaches the
+// router (WiFi.config()'d static IP skips the DHCP handshake entirely,
+// so DEVICE_HOSTNAME never got announced anywhere before this change) -
+// but it does mean the "fixed IP" guarantee now depends on the router's
+// reservation staying configured, rather than being self-contained in
+// this firmware. If you ever swap routers, that reservation needs
+// recreating there, or every other board's hardcoded IP references
+// break.
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
@@ -74,8 +80,9 @@ struct {
 } aisLinkStatus;
 
 // Set from the GPS's own $--RMC sentences so the dashboard can show local
-// time without needing internet/NTP access. Pacific time (with automatic
-// PST/PDT handling) is computed from this at render time in handleData().
+// time without needing internet/NTP access. Fixed Pacific Standard Time
+// (no DST switch - see setup()) is computed from this at render time in
+// handleData().
 bool gpsTimeValid = false;
 uint32_t gpsTimeLastSet = 0;
 
@@ -500,10 +507,11 @@ const char* TEMP_PROBE_NAMES[TEMP_PROBE_COUNT] = {"Cabin1", "Cabin2", "Outside"}
 // than by bus-discovery order, means it doesn't matter what order they
 // enumerate in at boot or whether one drops on/off the bus temporarily -
 // each reading is always matched to the physical probe it came from.
+// Each probe's 6-byte unique serial in forward OneWire address order:
 const uint8_t TEMP_PROBE_SERIAL[TEMP_PROBE_COUNT][6] = {
-  {0x03, 0x09, 0x97, 0x94, 0x0A, 0x0E}, // Cabin1
-  {0x03, 0x0E, 0x97, 0x94, 0x5C, 0xD6}, // Cabin2
-  {0x03, 0x01, 0x97, 0x94, 0x11, 0x84}, // Outside
+  {0xD6, 0x5C, 0x94, 0x97, 0x0E, 0x03}, // Cabin1  (Probe #0)
+  {0x0E, 0x0A, 0x94, 0x97, 0x09, 0x03}, // Cabin2  (Probe #1)
+  {0x84, 0x11, 0x94, 0x97, 0x01, 0x03}, // Outside (Probe #2)
 };
 DeviceAddress tempProbeAddr[TEMP_PROBE_COUNT]; // built from the serials above in setup()
 
@@ -543,6 +551,69 @@ void pollTemps() {
   tempConversionPending = false;
 }
 
+// ---------------------------------------------------------------------
+// Heap history - periodic samples of free heap + largest allocatable
+// block, kept in a rolling buffer so the dashboard can show a heap
+// trend over time instead of just the current footer snapshot. A single
+// reading can't tell a slow leak (free heap steadily dropping) or
+// growing fragmentation (largest block dropping faster than free heap)
+// apart from a stable-but-tight baseline - a trend over many hours can.
+// ---------------------------------------------------------------------
+const uint32_t HEAP_HISTORY_INTERVAL_MS = 10UL * 60 * 1000UL; // one sample per 10 minutes
+const int HEAP_HISTORY_SIZE = 288; // 48 hours at 10-minute resolution
+
+struct HeapHistoryPoint {
+  uint32_t timestamp;    // unix time if the GPS clock has ever been set, else seconds-since-boot
+  uint32_t freeHeap;
+  uint32_t maxAllocHeap;
+};
+
+HeapHistoryPoint heapHistory[HEAP_HISTORY_SIZE];
+int heapHistoryHead = 0;
+int heapHistoryCount = 0;
+uint32_t lastHeapSampleAt = 0;
+
+// Same "real time if the GPS clock has been set, else seconds-since-boot"
+// fallback pattern used on the icebox/heater boards' own history graphs.
+uint32_t currentTimestamp() {
+  time_t t = time(nullptr);
+  if (t > 1700000000L) return (uint32_t)t; // GPS clock has been set (post ~2023)
+  return millis() / 1000;
+}
+
+void pollHeapHistory() {
+  uint32_t now = millis();
+  // lastHeapSampleAt == 0 only at boot - sample immediately then, rather
+  // than waiting a full 10 minutes for the first point to appear.
+  if (lastHeapSampleAt != 0 && now - lastHeapSampleAt < HEAP_HISTORY_INTERVAL_MS) return;
+  lastHeapSampleAt = now;
+  heapHistory[heapHistoryHead] = { currentTimestamp(), (uint32_t)ESP.getFreeHeap(), (uint32_t)ESP.getMaxAllocHeap() };
+  heapHistoryHead = (heapHistoryHead + 1) % HEAP_HISTORY_SIZE;
+  if (heapHistoryCount < HEAP_HISTORY_SIZE) heapHistoryCount++;
+}
+
+// Global, not a local/stack buffer - large enough (up to ~14KB for a
+// full 288 points) that a local variable this size would risk
+// overflowing the request-handling task's stack.
+char heapHistoryBuf[16384];
+
+void handleHeapHistory() {
+  int pos = 0;
+  pos += snprintf(heapHistoryBuf + pos, sizeof(heapHistoryBuf) - pos, "[");
+  int start = (heapHistoryHead - heapHistoryCount + HEAP_HISTORY_SIZE) % HEAP_HISTORY_SIZE;
+  for (int i = 0; i < heapHistoryCount; i++) {
+    if (pos >= (int)sizeof(heapHistoryBuf) - 64) break; // safety margin against overflow
+    int idx = (start + i) % HEAP_HISTORY_SIZE;
+    pos += snprintf(heapHistoryBuf + pos, sizeof(heapHistoryBuf) - pos,
+                     "%s{\"t\":%u,\"f\":%u,\"m\":%u}",
+                     (i > 0) ? "," : "",
+                     heapHistory[idx].timestamp, heapHistory[idx].freeHeap, heapHistory[idx].maxAllocHeap);
+  }
+  pos += snprintf(heapHistoryBuf + pos, sizeof(heapHistoryBuf) - pos, "]");
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", heapHistoryBuf);
+}
+
 const char* chargeStateName(uint8_t state) {
   switch (state) {
     case CHARGER_OFF:              return "Off";
@@ -567,6 +638,10 @@ void onVictronData(const VictronDevice* dev) {
     solarLatest.lastUpdate = millis();
     solarLatest.valid = true;
     recordSolarCurrentSample(dev->solar.batteryCurrent, solarLatest.lastUpdate);
+
+// Log RSSI to Serial Monitor
+    Serial.printf("[BLE] Solar Charger updated | RSSI: %d dBm\n", dev->rssi);
+
   } else if (dev->deviceType == DEVICE_TYPE_BATTERY_MONITOR) {
     shuntLatest.data = dev->battery;
     shuntLatest.rssi = dev->rssi;
@@ -586,10 +661,11 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Victron Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   :root {
     --bg: #0f1720; --card: #182634; --text: #e8eef4; --muted: #8ea0b3;
-    --accent: #3ddc84; --accent2: #ffb020; --blue: #5b9dff; --bad: #ff5c5c;
+    --accent: #3ddc84; --accent2: #ffb020; --orange: #ffb020; --blue: #5b9dff; --bad: #ff5c5c;
     --border: #24384a; --wire: #2c4055;
   }
   * { box-sizing: border-box; }
@@ -651,7 +727,8 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
   .rows .label { color: var(--muted); font-size: 0.9rem; }
   .rows .value { font-weight: 600; font-size: 1rem; text-align: right; font-variant-numeric: tabular-nums; }
   .value.big { font-size: 1.4rem; color: var(--accent); }
-  .value.highlight-current {
+  .value.green { color: var(--accent); }
+{
     font-size: 1.3rem; font-weight: 700; color: var(--accent2);
     background: rgba(255,176,32,0.12); padding: 3px 10px; border-radius: 8px;
   }
@@ -663,6 +740,9 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
     color: var(--muted); font-size: 0.78rem; margin: 16px 0 10px 0;
     padding-top: 16px; border-top: 1px solid var(--border);
   }
+  .heap-card { margin-top: 18px; }
+  .heap-card h2 { margin: 0 0 4px 0; font-size: 1.05rem; }
+  .heap-card .sub-line { color: var(--muted); font-size: 0.8rem; margin-bottom: 14px; }
   .footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 24px; }
 
   /* ---------- GPS status bar ---------- */
@@ -737,11 +817,11 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
       <h2><span class="dot" id="shunt-dot"></span>Battery Shunt</h2>
       <div class="sub-line" id="shunt-age">waiting for data&hellip;</div>
       <div class="rows">
-        <div class="label">Voltage</div><div class="value big" id="shunt-voltage">&mdash;</div>
-        <div class="label">Current</div><div class="value highlight-current" id="shunt-current">&mdash;</div>
+        <div class="label">Voltage</div><div class="value" id="shunt-voltage">&mdash;</div>
+        <div class="label">Current</div><div class="value green big" id="shunt-current">&mdash;</div>
         <div class="label">Power</div><div class="value" id="shunt-power">&mdash;</div>
         <div class="label">State of charge</div><div class="value" id="shunt-soc">&mdash;</div>
-        <div class="label">Consumed</div><div class="value highlight-current" id="shunt-consumed">&mdash;</div>
+        <div class="label">Consumed</div><div class="value green big" id="shunt-consumed">&mdash;</div>
         <div class="label">Time remaining</div><div class="value" id="shunt-remaining">&mdash;</div>
         <div class="label">Starter Battery</div><div class="value" id="shunt-aux">&mdash;</div>
         <div class="label">Alarms</div><div class="value" id="shunt-alarms">&mdash;</div>
@@ -754,15 +834,15 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
       <div class="rows">
         <div class="label">Charge state</div><div class="value big" id="solar-state">&mdash;</div>
         <div class="label">Battery voltage</div><div class="value" id="solar-voltage">&mdash;</div>
-        <div class="label">Charge current</div><div class="value highlight-current" id="solar-current">&mdash;</div>
+        <div class="label">Charge current</div><div class="value green big" id="solar-current">&mdash;</div>
         <div class="label">Max current (10h)</div><div class="value" id="solar-max-current">&mdash;</div>
         <div class="label">Yield today</div><div class="value" id="solar-yield">&mdash;</div>
       </div>
       <div class="section-label">Temperatures</div>
       <div class="rows">
-        <div class="label">Cabin1</div><div class="value" id="temp-cabin1">&mdash;</div>
-        <div class="label">Cabin2</div><div class="value" id="temp-cabin2">&mdash;</div>
-        <div class="label">Outside</div><div class="value" id="temp-outside">&mdash;</div>
+        <div class="label">Cabin1</div><div class="value green big" id="temp-cabin1">&mdash;</div>
+        <div class="label">Cabin2</div><div class="value green big" id="temp-cabin2">&mdash;</div>
+        <div class="label">Outside</div><div class="value green big" id="temp-outside">&mdash;</div>
       </div>
     </div>
     <div class="card">
@@ -771,7 +851,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
           <h2><span class="dot" id="heater-dot"></span>Diesel Heater</h2>
           <div class="sub-line" id="heater-age">waiting for data&hellip;</div>
           <div class="rows">
-            <div class="label">Burn rate</div><div class="value highlight-current" id="heater-rate">&mdash;</div>
+            <div class="label">Burn rate</div><div class="value green big" id="heater-rate">&mdash;</div>
             <div class="label">Used today</div><div class="value" id="heater-today">&mdash;</div>
             <div class="label">Lifetime used</div><div class="value" id="heater-total">&mdash;</div>
             <div class="label">Tank level (1h max)</div><div class="value" id="heater-tank-pct">&mdash;</div>
@@ -790,6 +870,12 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
       </div>
     </div>
   </div>
+  <div class="card heap-card">
+    <h2>Heap Health</h2>
+    <div class="sub-line">Free heap and largest allocatable block, sampled every 10 minutes - a steadily dropping "free" line points to a leak; "free" staying flat while "largest block" drops faster points to fragmentation instead.</div>
+    <canvas id="heapChart" height="90"></canvas>
+  </div>
+
   <div class="footer">Auto-refreshing every 2s &middot; 192.168.8.66 &middot; <span id="sys-stats">uptime &mdash;</span></div>
 </div>
 
@@ -834,13 +920,28 @@ async function refresh() {
     // ---- detail cards (unchanged data) ----
     setDot("shunt-dot", d.shunt.valid, d.shunt.ageMs);
     document.getElementById("shunt-age").textContent = ageStr(d.shunt.valid ? d.shunt.ageMs : null);
-    if (d.shunt.valid) {
+if (d.shunt.valid) {
       document.getElementById("shunt-voltage").textContent = d.shunt.voltage.toFixed(2) + " V";
       document.getElementById("shunt-current").textContent = d.shunt.current.toFixed(2) + " A";
       document.getElementById("shunt-power").textContent = (d.shunt.voltage * d.shunt.current).toFixed(1) + " W";
       document.getElementById("shunt-soc").textContent = d.shunt.soc.toFixed(1) + " %";
-      document.getElementById("shunt-consumed").textContent = d.shunt.consumedAh.toFixed(1) + " Ah";
-      document.getElementById("shunt-remaining").textContent = d.shunt.remainingMinutes >= 65535 ? "—" : d.shunt.remainingMinutes + " min";
+      
+      // Dynamic color thresholds for Consumed Ah
+      const consumedEl = document.getElementById("shunt-consumed");
+      const ah = d.shunt.consumedAh;
+      consumedEl.textContent = ah.toFixed(1) + " Ah";
+
+      if (ah <= -350) {
+        consumedEl.style.color = "var(--bad)";      // Red below -350 Ah
+      } else if (ah <= -300) {
+        consumedEl.style.color = "var(--orange)";   // Orange below -300 Ah
+      } else if (ah <= -200) {
+        consumedEl.style.color = "var(--accent2)";  // Yellow at -200 Ah and below
+      } else {
+        consumedEl.style.color = "var(--accent)";   // Green until -200 Ah
+      }
+
+      document.getElementById("shunt-remaining").textContent = d.shunt.remainingMinutes >= 65535 ? "—" : d.shunt.remainingMinutes + " min"; d.shunt.remainingMinutes + " min";
       document.getElementById("shunt-aux").textContent = d.shunt.auxVoltage.toFixed(2) + " V";
       const alarms = [];
       if (d.shunt.alarmLowVoltage) alarms.push("Low V");
@@ -856,7 +957,7 @@ async function refresh() {
     setPill("ais-pill", d.ais.valid, d.ais.ageMs);
     const gpsTimeEl = document.getElementById("gps-time-text");
     gpsTimeEl.textContent = (d.gpsTime.valid && d.gpsTime.ageMs < 15000)
-      ? d.gpsTime.text + " PT"
+      ? d.gpsTime.text
       : "GPS time: no fix";
 
     setDot("solar-dot", d.solar.valid, d.solar.ageMs);
@@ -996,6 +1097,43 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2000);
+
+let heapChart;
+function fmtHeapTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+async function refreshHeapHistory() {
+  try {
+    const r = await fetch('/heap-history');
+    const j = await r.json();
+    const labels = j.map(p => fmtHeapTime(p.t));
+    const freeKb = j.map(p => Math.round(p.f / 1024));
+    const maxAllocKb = j.map(p => Math.round(p.m / 1024));
+
+    if (!heapChart) {
+      heapChart = new Chart(document.getElementById('heapChart'), {
+        type: 'line',
+        data: { labels, datasets: [
+          { label: 'Free heap (kB)', data: freeKb, borderColor:'#5b9dff', tension:0.2, pointRadius:0 },
+          { label: 'Largest block (kB)', data: maxAllocKb, borderColor:'#ffb020', tension:0.2, pointRadius:0 }
+        ]},
+        options: { responsive:true, animation:false,
+          scales: { x: { ticks: { color:'#8ea0b3', maxTicksLimit:12 } }, y: { ticks: { color:'#8ea0b3' }, beginAtZero:true } },
+          plugins: { legend: { labels: { color:'#e8eef4' } } } }
+      });
+    } else {
+      heapChart.data.labels = labels;
+      heapChart.data.datasets[0].data = freeKb;
+      heapChart.data.datasets[1].data = maxAllocKb;
+      heapChart.update();
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+refreshHeapHistory();
+setInterval(refreshHeapHistory, 60000);
 </script>
 </body>
 </html>
@@ -1029,8 +1167,8 @@ void handleData() {
   if (tankMaxValid) snprintf(tankMaxPctStr, sizeof(tankMaxPctStr), "%.1f", tankMaxPct);
 
   // Pacific-time string derived from the GPS-set system clock (see
-  // maybeUpdateGpsTime()). TZ is configured in setup() so localtime_r()
-  // handles the PST/PDT switch automatically.
+  // maybeUpdateGpsTime()). TZ is fixed at PST8 in setup() (no DST rule),
+  // so this always reads "PST" - it will not switch to PDT in summer.
   char gpsTimeStr[40] = "";
   if (gpsTimeValid) {
     time_t nowEpoch = time(nullptr);
@@ -1189,17 +1327,18 @@ void setup() {
   // own Serial.print calls are all confined to setup(), so this is
   // margin rather than a fix for a specific known problem. Must be
   // called before begin().
+
+  // In setup():
+  victron.setMinInterval(100); // Process packets faster if they arrive in bursts
+
   Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(200);
   Serial.println("\nVictron BLE Monitor starting...");
 
-  // ---- Wi-Fi with static IP ----
+  // ---- Wi-Fi (DHCP, with a router-side reservation for 192.168.8.66) ----
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(DEVICE_HOSTNAME); // must be set after mode(), before begin()
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("Static IP configuration failed!");
-  }
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
   // Bounded wait, not an infinite loop - if the router isn't up yet (e.g.
@@ -1231,20 +1370,25 @@ void setup() {
   // .local name resolution isn't needed. One less always-on service
   // competing for the board's limited heap.
 
-  // ---- Timezone: US Pacific (auto PST/PDT), used to render GPS time ----
-  setenv("TZ", "PST8PDT7,M3.2.0,M11.1.0/2", 1);
+  // ---- Timezone: US Pacific, fixed at PST year-round (no DST switch) ----
+  // Deliberately NOT using a TZ string with DST transition rules (like
+  // "PST8PDT7,M3.2.0,M11.1.0/2") - that would auto-switch to PDT every
+  // March/November, which is exactly the behavior being avoided here.
+  // Plain "PST8" is a fixed 8-hour-behind-UTC offset, permanently, with
+  // no daylight saving adjustment ever. This means the displayed time
+  // will read an hour "behind" clock time during DST months (roughly
+  // March-November) compared to what wall clocks around you show - that
+  // trade-off (a predictable, unchanging offset instead of a seasonal
+  // jump) is the intent here, not a bug.
+  setenv("TZ", "PST8", 1);
   tzset();
 
-  // ---- Victron BLE ----
-  // This project only ever does BLE scanning - never Classic Bluetooth -
-  // but the ESP32's Bluedroid stack reserves RAM for Classic BT by default
-  // regardless. Releasing it *before* the BLE controller comes up (inside
-  // victron.begin() below) hands that otherwise-wasted memory back to the
-  // heap - commonly tens of KB, which is a big deal on a board this tight
-  // on RAM. Must be called before any BT controller init happens, and it's
-  // one-way for the rest of this boot (can't go back to using Classic BT
-  // without a reboot) - fine here since we never use it.
+// ---- Victron BLE ----
+  // ESP32-S3 is a BLE-only chip (it does not have Classic BT hardware),
+  // so releasing Classic BT memory is only necessary on standard ESP32 boards.
+  #if !defined(CONFIG_IDF_TARGET_ESP32S3)
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  #endif
 
   victron.begin(5); // 5 second scan window
   victron.setCallback(onVictronData);
@@ -1267,6 +1411,7 @@ void setup() {
   // ---- Web server ----
   server.on("/", handleRoot);
   server.on("/data", handleData);
+  server.on("/heap-history", handleHeapHistory);
   server.begin();
   Serial.println("Web server started.");
   Serial.println("Dashboard: http://192.168.8.66/");
@@ -1339,5 +1484,6 @@ void loop() {
   victron.loop();
   pollTelemetry();
   pollTemps();
+  pollHeapHistory();
   server.handleClient();
 }
