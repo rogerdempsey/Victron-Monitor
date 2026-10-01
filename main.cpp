@@ -1,9 +1,8 @@
 // Victron BLE Monitor - ESP32
 //
 // Scans Victron "Instant Readout" BLE advertisements from a SmartShunt
-// (battery monitor) and a SmartSolar/BlueSolar MPPT, decrypts them, and
-// serves a live dashboard - with a current-flow diagram - on a static-IP
-// web page.
+// (battery monitor) and two SmartSolar/BlueSolar MPPTs (Port & Starboard),
+// decrypts them, and serves a live dashboard with a current-flow diagram.
 //
 // Library: scottp/victronble (installed automatically via platformio.ini)
 
@@ -12,23 +11,36 @@
 #include <stdlib.h>  // strtod - used by jsonNumberField
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <WebServer.h>
 #include <time.h>
 #include <sys/time.h>
+#include <Preferences.h>
 #include "VictronBLE.h"
 #include "esp_bt.h" // esp_bt_controller_mem_release() - see setup(), frees unused Classic BT RAM
 #include <esp_task_wdt.h> // task watchdog - see setup()/loop(), auto-reboots on a stuck loop()
 #include <esp_log.h> // esp_log_level_set() - see setup(), silences ESP-IDF component logging (WiFi/BLE/lwIP)
-#include "secrets.h" // WIFI_SSID/PASSWORD, SOLAR_MAC/KEY, SHUNT_MAC/KEY - see secrets.h.example
+#include "secrets.h" // WIFI_SSID/PASSWORD, SOLAR_PORT_MAC/KEY, SOLAR_STBD_MAC/KEY, SHUNT_MAC/KEY
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <math.h>
+
 
 // Network hostname - shows up in your router's client list / DHCP leases.
 const char* DEVICE_HOSTNAME = "VictronGPS";
 
-#define NAV_UDP_PORT 10110
-WiFiUDP navUdp;
-char navBuf[512];
+// TCP Navigation Data Endpoints
+const char* GPS_HOST = "192.168.8.178";
+const uint16_t GPS_PORT = 10110;
+WiFiClient gpsClient;
+String gpsRxBuf = "";
+uint32_t lastGpsReconnect = 0;
+
+const char* AIS_HOST = "192.168.8.144";
+const uint16_t AIS_PORT = 9000;
+WiFiClient aisClient;
+String aisRxBuf = "";
+uint32_t lastAisReconnect = 0;
 
 struct {
   bool everSeen = false;
@@ -52,6 +64,166 @@ struct {
   double courseDeg = 0;
 } gpsFix;
 
+
+
+// ---------------------------------------------------------------------
+// Astronomical Solar Calculation Structure & Function
+// ---------------------------------------------------------------------
+struct SunTimes {
+  bool valid = false;
+  time_t civilDawn; // Sun at -6 deg: civil twilight / bright enough to navigate
+  time_t sunrise;   // Sun at -0.833 deg
+  time_t sunset;    // Sun at -0.833 deg
+  time_t civilDusk; // Sun at -6 deg
+};
+
+
+// Convert a UTC struct tm into a time_t Unix timestamp without using TZ
+time_t utcMktime(const struct tm& tm) {
+    // Days per month in a non-leap year
+    static const int daysBeforeMonth[] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
+    };
+
+    int year = tm.tm_year + 1900;
+    int month = tm.tm_mon;
+
+    // Calculate leap years since Epoch (1970)
+    int leapYears = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+
+    long days = (year - 1970) * 365 + leapYears + daysBeforeMonth[month] + (tm.tm_mday - 1);
+
+    // Add extra leap day if current year is a leap year and past February
+    bool isLeap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    if (isLeap && month > 1) {
+        days++;
+    }
+
+    return (time_t)(days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+}
+
+SunTimes calculateSunTimes(double lat, double lon, time_t epochUtc) {
+  SunTimes result;
+  if (lat == 0.0 && lon == 0.0) return result;
+
+  struct tm tmUtc;
+  gmtime_r(&epochUtc, &tmUtc);
+
+  int N = tmUtc.tm_yday + 1;
+
+  auto getSunTime = [&](double zenith, bool isRising) -> time_t {
+    double lngHour = lon / 15.0;
+    double t = N + ((isRising ? 6.0 : 18.0) - lngHour) / 24.0;
+
+    double M = (0.9856 * t) - 3.289;
+
+    double L = M + (1.916 * sin(M * M_PI / 180.0)) + (0.020 * sin(2 * M * M_PI / 180.0)) + 282.634;
+    L = fmod(L, 360.0);
+    if (L < 0) L += 360.0;
+
+    double RA = atan(0.91764 * tan(L * M_PI / 180.0)) * 180.0 / M_PI;
+    RA = fmod(RA, 360.0);
+    if (RA < 0) RA += 360.0;
+
+    double Lquadrant  = floor(L / 90.0) * 90.0;
+    double RAquadrant = floor(RA / 90.0) * 90.0;
+    RA = RA + (Lquadrant - RAquadrant);
+    RA /= 15.0;
+
+    double sinDec = 0.39782 * sin(L * M_PI / 180.0);
+    double cosDec = cos(asin(sinDec));
+
+    double cosH = (cos(zenith * M_PI / 180.0) - (sinDec * sin(lat * M_PI / 180.0))) / (cosDec * cos(lat * M_PI / 180.0));
+    if (cosH > 1.0 || cosH < -1.0) return 0;
+
+    double H = isRising ? (360.0 - acos(cosH) * 180.0 / M_PI) : (acos(cosH) * 180.0 / M_PI);
+    H /= 15.0;
+
+    double T = H + RA - (0.06571 * t) - 6.622;
+
+    double UT = T - lngHour;
+    
+    // Compute midnight UTC for the given day using utcMktime
+    struct tm tmDay = {};
+    tmDay.tm_year = tmUtc.tm_year;
+    tmDay.tm_mon  = tmUtc.tm_mon;
+    tmDay.tm_mday = tmUtc.tm_mday;
+    
+    time_t dayStartUtc = utcMktime(tmDay);
+
+    return dayStartUtc + (time_t)(UT * 3600.0);
+  };
+
+  result.civilDawn = getSunTime(96.0, true);
+  result.sunrise   = getSunTime(90.833, true);
+  result.sunset    = getSunTime(90.833, false);
+  result.civilDusk = getSunTime(96.0, false);
+  result.valid     = (result.sunrise > 0 && result.sunset > 0);
+
+  return result;
+}
+
+// ---------------------------------------------------------------------
+// 24-Hour History Structures & Global Variables
+// ---------------------------------------------------------------------
+const uint32_t SOLAR_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
+const int SOLAR_24H_SIZE = 144;
+struct SolarHistoryPoint {
+  uint32_t timestamp;
+  float portCurrent;
+  float stbdCurrent;
+};
+SolarHistoryPoint solar24hHistory[SOLAR_24H_SIZE];
+int solar24hHead = 0;
+int solar24hCount = 0;
+uint32_t lastSolar24hSampleAt = 0;
+
+const uint32_t SHUNT_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
+const int SHUNT_24H_SIZE = 144;
+struct ShuntHistoryPoint {
+  uint32_t timestamp;
+  float current;
+};
+ShuntHistoryPoint shunt24hHistory[SHUNT_24H_SIZE];
+int shunt24hHead = 0;
+int shunt24hCount = 0;
+uint32_t lastShunt24hSampleAt = 0;
+
+// Shunt current accumulator for 10-minute continuous averaging
+float shuntSumCurrent = 0;
+uint32_t shuntSampleCount = 0;
+
+const uint32_t TEMP_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
+const int TEMP_24H_SIZE = 144;
+struct TempHistoryPoint {
+  uint32_t timestamp;
+  float cabin1;
+  float cabin2;
+  float outside;
+};
+TempHistoryPoint temp24hHistory[TEMP_24H_SIZE];
+int temp24hHead = 0;
+int temp24hCount = 0;
+uint32_t lastTemp24hSampleAt = 0;
+
+// ---------------------------------------------------------------------
+// Persistent 30-Day Solar Yield & Daily Peak Storage (NVS)
+// ---------------------------------------------------------------------
+Preferences prefs;
+
+struct SolarDailyPoint {
+  uint32_t epochDay; // Day index: epochSeconds / 86400
+  float portMaxAmps;
+  float stbdMaxAmps;
+  float portYieldAh;
+  float stbdYieldAh;
+};
+
+const int SOLAR_30D_SIZE = 30;
+SolarDailyPoint solar30dHistory[SOLAR_30D_SIZE];
+int solar30dCount = 0;
+uint32_t lastEpochDay = 0;
+
 String nmeaField(const String &s, int fieldIndex) {
   int start = 0;
   for (int i = 0; i < fieldIndex; i++) {
@@ -73,10 +245,6 @@ static long daysFromEpoch(int year, int month, int day) {
   return era * 146097 + (long)doe - 719468;
 }
 
-static time_t utcMktime(const struct tm &t) {
-  long days = daysFromEpoch(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-  return (time_t)days * 86400L + t.tm_hour * 3600L + t.tm_min * 60L + t.tm_sec;
-}
 
 void maybeUpdateGpsTime(const String &line) {
   if (line.length() < 6 || line.charAt(0) != '$') return;
@@ -98,10 +266,21 @@ void maybeUpdateGpsTime(const String &line) {
   time_t utcEpoch = utcMktime(t);
   if (utcEpoch < 1700000000) return;
 
+  bool firstTimeSync = !gpsTimeValid;
+
   struct timeval tv = { .tv_sec = utcEpoch, .tv_usec = 0 };
   settimeofday(&tv, nullptr);
   gpsTimeValid = true;
   gpsTimeLastSet = millis();
+
+  if (firstTimeSync) {
+    uint32_t oldTimeSec = millis() / 1000;
+    int32_t timeDelta = (int32_t)utcEpoch - (int32_t)oldTimeSec;
+
+    for (int i = 0; i < solar24hCount; i++) solar24hHistory[i].timestamp += timeDelta;
+    for (int i = 0; i < shunt24hCount; i++) shunt24hHistory[i].timestamp += timeDelta;
+    for (int i = 0; i < temp24hCount; i++) temp24hHistory[i].timestamp += timeDelta;
+  }
 }
 
 double nmeaCoordToDecimal(const String &field, char hemisphere) {
@@ -135,43 +314,102 @@ void maybeUpdateGpsPosition(const String &line) {
   gpsFix.lastUpdate = millis();
 }
 
-void pollNav() {
-  int packetSize = navUdp.parsePacket();
-  if (packetSize <= 0) return;
-  int len = navUdp.read(navBuf, sizeof(navBuf) - 1);
-  if (len <= 0) return;
-  navBuf[len] = '\0';
-
+void processNmeaSentence(const String &line) {
   uint32_t now = millis();
-  char *line = strtok(navBuf, "\r\n");
-  while (line != nullptr) {
-    size_t lineLen = strlen(line);
-    if (lineLen > 1) {
-      if (line[0] == '$') {
-        gpsLinkStatus.everSeen = true;
-        gpsLinkStatus.lastSentence = now;
-        String sentence(line);
-        maybeUpdateGpsTime(sentence);
-        maybeUpdateGpsPosition(sentence);
-      } else if (line[0] == '!') {
-        aisLinkStatus.everSeen = true;
-        aisLinkStatus.lastByte = now;
+  if (line.startsWith("$")) {
+    gpsLinkStatus.everSeen = true;
+    gpsLinkStatus.lastSentence = now;
+    maybeUpdateGpsTime(line);
+    maybeUpdateGpsPosition(line);
+  } else if (line.startsWith("!")) {
+    aisLinkStatus.everSeen = true;
+    aisLinkStatus.lastByte = now;
+  }
+}
+
+const uint32_t GPS_TIMEOUT_MS = 10000; // 10-second timeout for missing data
+
+void pollGpsTcp() {
+  uint32_t now = millis();
+
+  // 1. Force disconnect if the connection was lost or timed out due to no incoming data
+  if (gpsClient.connected() && gpsLinkStatus.everSeen && (now - gpsLinkStatus.lastSentence > GPS_TIMEOUT_MS)) {
+    Serial.println("[GPS] Connection timed out (no data received). Reconnecting...");
+    gpsClient.stop();
+  }
+
+  // 2. Handle reconnection attempt
+  if (!gpsClient.connected()) {
+    if (now - lastGpsReconnect > 5000) {
+      lastGpsReconnect = now;
+      gpsClient.stop(); // Ensure socket resources are freed before connecting
+      Serial.println("[GPS] Attempting TCP reconnect...");
+      if (gpsClient.connect(GPS_HOST, GPS_PORT)) {
+        Serial.println("[GPS] Connected successfully.");
+        // Refresh lastSentence timestamp so it doesn't instantly trigger a timeout on reconnect
+        gpsLinkStatus.lastSentence = millis(); 
       }
     }
-    line = strtok(nullptr, "\r\n");
+    return;
+  }
+
+  // 3. Process incoming data
+  while (gpsClient.available() > 0) {
+    char c = gpsClient.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      gpsRxBuf.trim();
+      if (gpsRxBuf.length() > 0) {
+        processNmeaSentence(gpsRxBuf);
+      }
+      gpsRxBuf = "";
+    } else {
+      gpsRxBuf += c;
+      if (gpsRxBuf.length() > 256) gpsRxBuf = "";
+    }
+  }
+}
+
+void pollAisTcp() {
+  uint32_t now = millis();
+
+  if (!aisClient.connected()) {
+    if (now - lastAisReconnect > 5000) {
+      lastAisReconnect = now;
+      aisClient.stop();
+      aisClient.connect(AIS_HOST, AIS_PORT);
+    }
+    return;
+  }
+
+  while (aisClient.available() > 0) {
+    char c = aisClient.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      aisRxBuf.trim();
+      if (aisRxBuf.length() > 0) {
+        processNmeaSentence(aisRxBuf);
+      }
+      aisRxBuf = "";
+    } else {
+      aisRxBuf += c;
+      if (aisRxBuf.length() > 256) aisRxBuf = "";
+    }
   }
 }
 
 VictronBLE victron;
 WebServer server(80);
-uint32_t bootFreeHeap = 0;
 
-struct {
+struct SolarDataHolder {
   bool valid = false;
   uint32_t lastUpdate = 0;
   int8_t rssi = 0;
   VictronSolarData data;
-} solarLatest;
+};
+
+SolarDataHolder solarPortLatest;
+SolarDataHolder solarStbdLatest;
 
 struct {
   bool valid = false;
@@ -183,32 +421,35 @@ struct {
 const uint32_t SOLAR_CURRENT_BUCKET_MS = 10UL * 60 * 1000UL;
 const int SOLAR_CURRENT_NUM_BUCKETS = 60;
 
-struct {
+struct SolarCurrentTracker {
   double maxCurrent[SOLAR_CURRENT_NUM_BUCKETS] = {0};
   uint32_t bucketEpoch[SOLAR_CURRENT_NUM_BUCKETS] = {0};
-} solarCurrentHistory;
+};
 
-void recordSolarCurrentSample(double amps, uint32_t now) {
+SolarCurrentTracker solarPortHistoryTracker;
+SolarCurrentTracker solarStbdHistoryTracker;
+
+void recordSolarCurrentSample(SolarCurrentTracker &tracker, double amps, uint32_t now) {
   uint32_t epoch = now / SOLAR_CURRENT_BUCKET_MS + 1;
   int idx = epoch % SOLAR_CURRENT_NUM_BUCKETS;
-  if (solarCurrentHistory.bucketEpoch[idx] != epoch) {
-    solarCurrentHistory.bucketEpoch[idx] = epoch;
-    solarCurrentHistory.maxCurrent[idx] = amps;
-  } else if (amps > solarCurrentHistory.maxCurrent[idx]) {
-    solarCurrentHistory.maxCurrent[idx] = amps;
+  if (tracker.bucketEpoch[idx] != epoch) {
+    tracker.bucketEpoch[idx] = epoch;
+    tracker.maxCurrent[idx] = amps;
+  } else if (amps > tracker.maxCurrent[idx]) {
+    tracker.maxCurrent[idx] = amps;
   }
 }
 
-double solarMaxCurrentLast10h(uint32_t now) {
+double solarMaxCurrentLast10h(const SolarCurrentTracker &tracker, uint32_t now) {
   uint32_t currentEpoch = now / SOLAR_CURRENT_BUCKET_MS + 1;
   double best = 0;
   bool any = false;
   for (int i = 0; i < SOLAR_CURRENT_NUM_BUCKETS; i++) {
-    uint32_t epoch = solarCurrentHistory.bucketEpoch[i];
+    uint32_t epoch = tracker.bucketEpoch[i];
     if (epoch == 0) continue;
     if (currentEpoch - epoch >= (uint32_t)SOLAR_CURRENT_NUM_BUCKETS) continue;
-    if (!any || solarCurrentHistory.maxCurrent[i] > best) {
-      best = solarCurrentHistory.maxCurrent[i];
+    if (!any || tracker.maxCurrent[i] > best) {
+      best = tracker.maxCurrent[i];
       any = true;
     }
   }
@@ -394,17 +635,103 @@ const char* chargeStateName(uint8_t state) {
 
 void onVictronData(const VictronDevice* dev) {
   if (dev->deviceType == DEVICE_TYPE_SOLAR_CHARGER) {
-    solarLatest.data = dev->solar;
-    solarLatest.rssi = dev->rssi;
-    solarLatest.lastUpdate = millis();
-    solarLatest.valid = true;
-    recordSolarCurrentSample(dev->solar.batteryCurrent, solarLatest.lastUpdate);
-    Serial.printf("[BLE] Solar Charger updated | RSSI: %d dBm\n", dev->rssi);
+    if (strcmp(dev->name, "Port Solar") == 0) {
+      solarPortLatest.data = dev->solar;
+      solarPortLatest.rssi = dev->rssi;
+      solarPortLatest.lastUpdate = millis();
+      solarPortLatest.valid = true;
+      recordSolarCurrentSample(solarPortHistoryTracker, dev->solar.batteryCurrent, solarPortLatest.lastUpdate);
+      Serial.printf("[BLE] Port Solar Charger updated | RSSI: %d dBm\n", dev->rssi);
+    } else if (strcmp(dev->name, "Starboard Solar") == 0) {
+      solarStbdLatest.data = dev->solar;
+      solarStbdLatest.rssi = dev->rssi;
+      solarStbdLatest.lastUpdate = millis();
+      solarStbdLatest.valid = true;
+      recordSolarCurrentSample(solarStbdHistoryTracker, dev->solar.batteryCurrent, solarStbdLatest.lastUpdate);
+      Serial.printf("[BLE] Starboard Solar Charger updated | RSSI: %d dBm\n", dev->rssi);
+    }
   } else if (dev->deviceType == DEVICE_TYPE_BATTERY_MONITOR) {
     shuntLatest.data = dev->battery;
     shuntLatest.rssi = dev->rssi;
     shuntLatest.lastUpdate = millis();
     shuntLatest.valid = true;
+
+    shuntSumCurrent += (float)dev->battery.current;
+    shuntSampleCount++;
+  }
+}
+
+// ---------------------------------------------------------------------
+// NVS Helpers & Midnight Rollover Check
+// ---------------------------------------------------------------------
+void loadSolar30dHistory() {
+  prefs.begin("solar30d", true);
+  solar30dCount = prefs.getBytes("history", solar30dHistory, sizeof(solar30dHistory)) / sizeof(SolarDailyPoint);
+  prefs.end();
+  if (solar30dCount > SOLAR_30D_SIZE || solar30dCount < 0) solar30dCount = 0;
+}
+
+void saveSolar30dHistory() {
+  prefs.begin("solar30d", false);
+  prefs.putBytes("history", solar30dHistory, solar30dCount * sizeof(SolarDailyPoint));
+  prefs.end();
+}
+
+// Static holders to track peak yield reached throughout the current day
+static float portDailyPeakYieldAh = 0.0f;
+static float stbdDailyPeakYieldAh = 0.0f;
+
+void pollSolar30dHistory() {
+  if (!gpsTimeValid) return;
+
+  // Continuously track the highest yield reached today before midnight reset
+  if (solarPortLatest.valid && solarPortLatest.data.batteryVoltage > 0) {
+    float portAh = (float)solarPortLatest.data.yieldToday / solarPortLatest.data.batteryVoltage;
+    if (portAh > portDailyPeakYieldAh) portDailyPeakYieldAh = portAh;
+  }
+  if (solarStbdLatest.valid && solarStbdLatest.data.batteryVoltage > 0) {
+    float stbdAh = (float)solarStbdLatest.data.yieldToday / solarStbdLatest.data.batteryVoltage;
+    if (stbdAh > stbdDailyPeakYieldAh) stbdDailyPeakYieldAh = stbdAh;
+  }
+
+  time_t nowEpoch = time(nullptr);
+  struct tm localTm;
+  localtime_r(&nowEpoch, &localTm);
+
+  uint32_t currentLocalDay = (uint32_t)localTm.tm_mday;
+
+  if (lastEpochDay == 0) {
+    lastEpochDay = currentLocalDay;
+    return;
+  }
+
+  // Midnight Rollover
+  if (currentLocalDay != lastEpochDay) {
+    uint32_t localEpochDay = (uint32_t)((nowEpoch - 28800L) / 86400L);
+
+    SolarDailyPoint newPoint = {
+      localEpochDay,
+      (float)solarMaxCurrentLast10h(solarPortHistoryTracker, millis()),
+      (float)solarMaxCurrentLast10h(solarStbdHistoryTracker, millis()),
+      portDailyPeakYieldAh, // Log stored peak yield
+      stbdDailyPeakYieldAh
+    };
+
+    if (solar30dCount < SOLAR_30D_SIZE) {
+      solar30dHistory[solar30dCount++] = newPoint;
+    } else {
+      for (int i = 0; i < SOLAR_30D_SIZE - 1; i++) {
+        solar30dHistory[i] = solar30dHistory[i + 1];
+      }
+      solar30dHistory[SOLAR_30D_SIZE - 1] = newPoint;
+    }
+
+    saveSolar30dHistory();
+    
+    // Reset trackers for the new day
+    portDailyPeakYieldAh = 0.0f;
+    stbdDailyPeakYieldAh = 0.0f;
+    lastEpochDay = currentLocalDay;
   }
 }
 
@@ -474,9 +801,10 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
   /* ---------- Detail cards ---------- */
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
-  .card h2 { margin: 0 0 4px 0; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; }
+  .card h2, .card h1 { margin: 0 0 4px 0; font-size: 1.05rem; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card .header-title { display: flex; align-items: center; gap: 8px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
-  .dot.ok { background: var(--accent); }
+  .dot.ok, .dot.green-dot { background: var(--accent); }
   .dot.stale { background: var(--bad); }
   .sub-line { color: var(--muted); font-size: 0.8rem; margin-bottom: 14px; }
   .rows { display: grid; grid-template-columns: 1fr auto; row-gap: 10px; column-gap: 12px; }
@@ -492,6 +820,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
     color: var(--muted); font-size: 0.78rem; margin: 16px 0 10px 0;
     padding-top: 16px; border-top: 1px solid var(--border);
   }
+  .sub-header-text { font-size: 0.9rem; font-weight: normal; color: var(--muted); margin-right: 0.6em; }
 
   .footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 24px; }
 
@@ -564,32 +893,46 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
 
   <div class="grid">
     <div class="card">
-      <h2><span class="dot" id="shunt-dot"></span><a href="/shunt" style="color: inherit; text-decoration: none;">Battery Shunt</a></h2>
+      <h2><span class="header-title"><span class="dot" id="shunt-dot"></span><a href="/shunt" style="color: inherit; text-decoration: none;">Battery Shunt</a></span></h2>
       <div class="sub-line" id="shunt-age">waiting for data&hellip;</div>
       <div class="rows">
         <div class="label">Voltage</div><div class="value" id="shunt-voltage">&mdash;</div>
         <div class="label">Current</div><div class="value big" id="shunt-current">&mdash;</div>
-        <div class="label">Power</div><div class="value" id="shunt-power">&mdash;</div>
         <div class="label">State of charge</div><div class="value" id="shunt-soc">&mdash;</div>
         <div class="label">Consumed</div><div class="value green big" id="shunt-consumed">&mdash;</div>
-        <div class="label">Time remaining</div><div class="value" id="shunt-remaining">&mdash;</div>
         <div class="label">Starter Battery</div><div class="value" id="shunt-aux">&mdash;</div>
         <div class="label">Alarms</div><div class="value" id="shunt-alarms">&mdash;</div>
-        <div class="label">Signal</div><div class="value" id="shunt-rssi">&mdash;</div>
+      </div>
+
+      <!-- Sunrise / Sunset Status Indicator -->
+      <div class="section-label" style="border-top: 1px solid var(--border); padding-top: 16px; margin-top: 16px;">
+        <h2 style="margin: 0;">
+          <span class="header-title">
+            <span class="dot green-dot" id="sun-dot"></span>
+            Sunrise / Sunset
+          </span>
+        </h2>
+      </div>
+
+      <div class="rows">
+        <div class="label">Civil Dawn</div><div class="value green big" id="sun-dawn">&mdash;</div>
+        <div class="label">Sunrise / Sunset</div><div class="value" id="sun-rise-set">&mdash; / &mdash;</div>
+        <div class="label">Civil Dusk</div><div class="value green big" id="sun-dusk">&mdash;</div>
       </div>
     </div>
     <div class="card">
-      <h2><span class="dot" id="solar-dot"></span><a href="/solar" style="color: inherit; text-decoration: none;">Solar Charger</a></h2>
+      <h2><span class="header-title"><span class="dot" id="solar-dot"></span><a href="/solar" style="color: inherit; text-decoration: none;">Solar Chargers</a></span><span class="sub-header-text">Port / Stbd</span></h2>
       <div class="sub-line" id="solar-age">waiting for data&hellip;</div>
       <div class="rows">
-        <div class="label">Charge state</div><div class="value big" id="solar-state">&mdash;</div>
-        <div class="label">Battery voltage</div><div class="value" id="solar-voltage">&mdash;</div>
-        <div class="label">Charge current</div><div class="value green big" id="solar-current">&mdash;</div>
-        <div class="label">Max current (10h)</div><div class="value" id="solar-max-current">&mdash;</div>
-        <div class="label">Yield today</div><div class="value" id="solar-yield">&mdash;</div>
+        <div class="label">Charge state</div><div class="value big" id="solar-state">&mdash; / &mdash;</div>
+        <div class="label">Battery voltage (V)</div><div class="value" id="solar-voltage">&mdash; / &mdash;</div>
+        <div class="label">Charge current (A)</div><div class="value green big" id="solar-current">&mdash; / &mdash;</div>
+        <div class="label">Max current 10h (A)</div><div class="value" id="solar-max-current">&mdash; / &mdash;</div>
+        <div class="label"><a href="/solar-yield" style="color: inherit; text-decoration: none; text-underline-offset: 3px;">Yield today (Ah)</a></div><div class="value" id="solar-yield">&mdash; / &mdash;</div>
       </div>
+
       <div class="section-label" style="border-top: 1px solid var(--border); padding-top: 16px; margin-top: 16px;">
-        <h2 style="font-size: 1.05rem; margin: 0;"><span class="dot" id="temps-dot"></span><a href="/temps" style="color: inherit; text-decoration: none;">Temperatures</a></h2>
+      <h1 style="color: var(--text);"><span class="header-title"><span class="dot" id="temps-dot"></span><a href="/temps" style="color: inherit; text-decoration: none;">Temperatures</a></span></h1>
       </div>
       <div class="rows">
         <div class="label">Cabin1</div><div class="value green big" id="temp-cabin1">&mdash;</div>
@@ -600,7 +943,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
     <div class="card">
       <div class="split">
         <div class="half">
-          <h2><span class="dot" id="heater-dot"></span><a href="http://192.168.8.65/" style="color: inherit; text-decoration: none;">Diesel Heater</a></h2>
+          <h2><span class="header-title"><span class="dot" id="heater-dot"></span><a href="http://192.168.8.65/" style="color: inherit; text-decoration: none;">Diesel Heater</a></span></h2>
           <div class="sub-line" id="heater-age">waiting for data&hellip;</div>
           <div class="rows">
             <div class="label">Burn rate</div><div class="value green big" id="heater-rate">&mdash;</div>
@@ -610,7 +953,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
           </div>
         </div>
         <div class="half">
-          <h2><span class="dot" id="icebox-dot"></span><a href="http://192.168.8.67/" style="color: inherit; text-decoration: none;">Icebox</a></h2>
+          <h2><span class="header-title"><span class="dot" id="icebox-dot"></span><a href="http://192.168.8.67/" style="color: inherit; text-decoration: none;">Icebox</a></span></h2>
           <div class="sub-line" id="icebox-age">waiting for data&hellip;</div>
           <div class="rows">
             <div class="label">Fridge</div><div class="value big" id="icebox-fridge">&mdash;</div>
@@ -626,6 +969,8 @@ const char PAGE_HTML[] PROGMEM = R"HTML(
   <div class="footer">Auto-refreshing every 2s &middot; 192.168.8.66 &middot; <span id="sys-stats">uptime &mdash;</span></div>
 </div>
 
+
+
 <script>
 function ageStr(ms) {
   if (ms == null) return "no data yet";
@@ -639,9 +984,9 @@ function setDot(id, valid, ageMs) {
   el.className = "dot " + (!valid ? "" : (ageMs < 15000 ? "ok" : "stale"));
 }
 
-function setPill(id, valid, ageMs) {
+function setPill(id, valid, ageMs, maxAgeMs = 15000) {
   const el = document.getElementById(id);
-  const connected = valid && ageMs < 15000;
+  const connected = valid && ageMs < maxAgeMs;
   el.className = "status-pill " + (connected ? "ok" : "bad");
 }
 
@@ -664,8 +1009,18 @@ async function refresh() {
 
     setDot("shunt-dot", d.shunt.valid, d.shunt.ageMs);
     document.getElementById("shunt-age").textContent = ageStr(d.shunt.valid ? d.shunt.ageMs : null);
-    if (d.shunt.valid) {
-      document.getElementById("shunt-voltage").textContent = d.shunt.voltage.toFixed(2) + " V";
+   if (d.shunt.valid) {
+     const voltageEl = document.getElementById("shunt-voltage");
+     const voltageV = d.shunt.voltage;
+     voltageEl.textContent = voltageV.toFixed(2) + " V";
+
+  if (voltageV < 12.9) {
+    voltageEl.style.color = "var(--bad)";      // Red
+  } else if (voltageV < 13.0) {
+    voltageEl.style.color = "var(--accent2)";  // Yellow / Orange
+  } else {
+    voltageEl.style.color = "var(--text)";     // Default light text
+  }
       const currentEl = document.getElementById("shunt-current");
       const currentA = d.shunt.current;
       currentEl.textContent = currentA.toFixed(2) + " A";
@@ -677,7 +1032,6 @@ async function refresh() {
       } else {
         currentEl.style.color = "var(--text)";
       }
-      document.getElementById("shunt-power").textContent = (d.shunt.voltage * d.shunt.current).toFixed(1) + " W";
       document.getElementById("shunt-soc").textContent = d.shunt.soc.toFixed(1) + " %";
       
       const consumedEl = document.getElementById("shunt-consumed");
@@ -694,7 +1048,6 @@ async function refresh() {
         consumedEl.style.color = "var(--accent)";
       }
 
-      document.getElementById("shunt-remaining").textContent = d.shunt.remainingMinutes >= 65535 ? "—" : d.shunt.remainingMinutes + " min";
       document.getElementById("shunt-aux").textContent = d.shunt.auxVoltage.toFixed(2) + " V";
       const alarms = [];
       if (d.shunt.alarmLowVoltage) alarms.push("Low V");
@@ -703,27 +1056,57 @@ async function refresh() {
       if (d.shunt.alarmLowTemperature) alarms.push("Low temp");
       if (d.shunt.alarmHighTemperature) alarms.push("High temp");
       document.getElementById("shunt-alarms").textContent = alarms.length ? alarms.join(", ") : "none";
-      document.getElementById("shunt-rssi").textContent = d.shunt.rssi + " dBm";
+    }
+
+    if (d.sun && d.sun.valid) {
+      document.getElementById("sun-dawn").textContent = d.sun.dawn;
+      document.getElementById("sun-rise-set").textContent = d.sun.rise + " / " + d.sun.set;
+      document.getElementById("sun-dusk").textContent = d.sun.dusk;
+    } else {
+      document.getElementById("sun-dawn").textContent = "No GPS fix";
+      document.getElementById("sun-rise-set").textContent = "— / —";
+      document.getElementById("sun-dusk").textContent = "No GPS fix";
     }
 
     setPill("gps-pill", d.gps.valid, d.gps.ageMs);
-    setPill("ais-pill", d.ais.valid, d.ais.ageMs);
+    setPill("ais-pill", d.ais.valid, d.ais.ageMs, 60000);
     const gpsTimeValid = d.gpsTime.valid && d.gpsTime.ageMs < 15000;
     setPill("gps-time-text", d.gpsTime.valid, d.gpsTime.ageMs);
     document.getElementById("gps-time-text").textContent = gpsTimeValid
       ? d.gpsTime.text
       : "NO FIX";
 
-    setDot("solar-dot", d.solar.valid, d.solar.ageMs);
-    document.getElementById("solar-age").textContent = ageStr(d.solar.valid ? d.solar.ageMs : null);
-    if (d.solar.valid) {
-      document.getElementById("solar-state").textContent = d.solar.chargeState;
-      document.getElementById("solar-voltage").textContent = d.solar.batteryVoltage.toFixed(2) + " V";
-      document.getElementById("solar-current").textContent = d.solar.batteryCurrent.toFixed(2) + " A";
-      document.getElementById("solar-max-current").textContent = d.solar.maxCurrent10h.toFixed(2) + " A";
-      const yieldAh = d.solar.batteryVoltage > 0 ? d.solar.yieldToday / d.solar.batteryVoltage : 0;
-      document.getElementById("solar-yield").textContent = yieldAh.toFixed(1) + " Ah";
-    }
+    const portOk = d.solarPort && d.solarPort.valid;
+    const stbdOk = d.solarStbd && d.solarStbd.valid;
+    const solarValid = portOk || stbdOk;
+    const minSolarAge = Math.min(portOk ? d.solarPort.ageMs : Infinity, stbdOk ? d.solarStbd.ageMs : Infinity);
+
+    setDot("solar-dot", solarValid, minSolarAge);
+    document.getElementById("solar-age").textContent = ageStr(solarValid ? minSolarAge : null);
+
+    const portState = portOk ? d.solarPort.chargeState : "—";
+    const stbdState = stbdOk ? d.solarStbd.chargeState : "—";
+    document.getElementById("solar-state").textContent = portState + " / " + stbdState;
+
+    const portVolts = portOk ? d.solarPort.batteryVoltage.toFixed(2) : "—";
+    const stbdVolts = stbdOk ? d.solarStbd.batteryVoltage.toFixed(2) : "—";
+    document.getElementById("solar-voltage").textContent = portVolts + " / " + stbdVolts;
+
+    const portCurr = portOk ? d.solarPort.batteryCurrent : 0;
+    const stbdCurr = stbdOk ? d.solarStbd.batteryCurrent : 0;
+    const portCurrStr = portOk ? portCurr.toFixed(2) : "—";
+    const stbdCurrStr = stbdOk ? stbdCurr.toFixed(2) : "—";
+    document.getElementById("solar-current").textContent = portCurrStr + " / " + stbdCurrStr;
+
+    const portMax = portOk ? d.solarPort.maxCurrent10h.toFixed(2) : "—";
+    const stbdMax = stbdOk ? d.solarStbd.maxCurrent10h.toFixed(2) : "—";
+    document.getElementById("solar-max-current").textContent = portMax + " / " + stbdMax;
+
+    const portYieldAh = (portOk && d.solarPort.batteryVoltage > 0) ? (d.solarPort.yieldToday / d.solarPort.batteryVoltage) : 0;
+    const stbdYieldAh = (stbdOk && d.solarStbd.batteryVoltage > 0) ? (d.solarStbd.yieldToday / d.solarStbd.batteryVoltage) : 0;
+    const portYieldStr = portOk ? portYieldAh.toFixed(1) : "—";
+    const stbdYieldStr = stbdOk ? stbdYieldAh.toFixed(1) : "—";
+    document.getElementById("solar-yield").textContent = portYieldStr + " / " + stbdYieldStr;
 
     setDot("temps-dot", d.temps.valid, d.temps.ageMs);
     const tempEls = { cabin1: "temp-cabin1", cabin2: "temp-cabin2", outside: "temp-outside" };
@@ -759,14 +1142,18 @@ async function refresh() {
       document.getElementById("icebox-duty").textContent = d.icebox.dutyPercent + " %";
     }
 
-    const solarOk = d.solar.valid, battOk = d.shunt.valid;
-    const solarA = solarOk ? d.solar.batteryCurrent : 0;
+    const solarOk = solarValid, battOk = d.shunt.valid;
+    const solarA = portCurr + stbdCurr;
+    const portW = portOk ? d.solarPort.panelPower : 0;
+    const stbdW = stbdOk ? d.solarStbd.panelPower : 0;
+    const solarW = portW + stbdW;
+
     const battA  = battOk ? d.shunt.current : 0;
-    const voltage = battOk ? d.shunt.voltage : (solarOk ? d.solar.batteryVoltage : 0);
+    const voltage = battOk ? d.shunt.voltage : (portOk ? d.solarPort.batteryVoltage : (stbdOk ? d.solarStbd.batteryVoltage : 0));
     const loadA = (solarOk && battOk) ? Math.max(0, solarA - battA) : null;
 
     document.getElementById("fd-solar-amps").textContent = solarOk ? solarA.toFixed(2) + " A" : "—";
-    document.getElementById("fd-solar-sub").textContent = solarOk ? d.solar.panelPower.toFixed(0) + " W" : "no data";
+    document.getElementById("fd-solar-sub").textContent = solarOk ? solarW.toFixed(0) + " W" : "no data";
     setFlow(document.getElementById("dash-solar"), solarOk && solarA > THRESH, solarA, false);
 
     document.getElementById("fd-load-amps").textContent = loadA !== null ? loadA.toFixed(2) + " A" : "—";
@@ -802,11 +1189,8 @@ async function refresh() {
 
     if (d.system) {
       const uptimeH = (d.system.uptimeSec / 3600).toFixed(1);
-      const freeKb = (d.system.freeHeap / 1024).toFixed(0);
-      const bootKb = (d.system.bootFreeHeap / 1024).toFixed(0);
-      const maxAllocKb = (d.system.maxAllocHeap / 1024).toFixed(0);
       document.getElementById("sys-stats").textContent =
-        `uptime ${uptimeH}h \u00b7 heap ${bootKb}kB at boot \u2192 ${freeKb}kB now \u00b7 ${maxAllocKb}kB largest block`;
+        `uptime ${uptimeH}h`;
     }
 
   } catch (e) {
@@ -815,7 +1199,6 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2000);
-
 </script>
 </body>
 </html>
@@ -831,28 +1214,18 @@ uint32_t currentTimestamp() {
 }
 
 // ---------------------------------------------------------------------
-// Rolling 24-hour Solar Charge Current History (144 samples @ 10-min interval)
+// Rolling 24-hour Solar Charge Current History (Port & Starboard)
 // ---------------------------------------------------------------------
-const uint32_t SOLAR_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
-const int SOLAR_24H_SIZE = 144;
-
-struct SolarHistoryPoint {
-  uint32_t timestamp;
-  float current;
-};
-
-SolarHistoryPoint solar24hHistory[SOLAR_24H_SIZE];
-int solar24hHead = 0;
-int solar24hCount = 0;
-uint32_t lastSolar24hSampleAt = 0;
-
 void pollSolarHistory() {
-  if (!solarLatest.valid) return;
+  if (!solarPortLatest.valid && !solarStbdLatest.valid) return;
   uint32_t now = millis();
   if (lastSolar24hSampleAt != 0 && now - lastSolar24hSampleAt < SOLAR_24H_INTERVAL_MS) return;
   lastSolar24hSampleAt = now;
 
-  solar24hHistory[solar24hHead] = { currentTimestamp(), (float)solarLatest.data.batteryCurrent };
+  float portCurrent = solarPortLatest.valid ? (float)solarPortLatest.data.batteryCurrent : 0.0f;
+  float stbdCurrent = solarStbdLatest.valid ? (float)solarStbdLatest.data.batteryCurrent : 0.0f;
+
+  solar24hHistory[solar24hHead] = { currentTimestamp(), portCurrent, stbdCurrent };
   solar24hHead = (solar24hHead + 1) % SOLAR_24H_SIZE;
   if (solar24hCount < SOLAR_24H_SIZE) solar24hCount++;
 }
@@ -867,9 +1240,11 @@ void handleSolarHistory() {
     if (pos >= (int)sizeof(solarHistoryBuf) - 64) break;
     int idx = (start + i) % SOLAR_24H_SIZE;
     pos += snprintf(solarHistoryBuf + pos, sizeof(solarHistoryBuf) - pos,
-                     "%s{\"t\":%u,\"c\":%.2f}",
+                     "%s{\"t\":%u,\"p\":%.2f,\"s\":%.2f}",
                      (i > 0) ? "," : "",
-                     solar24hHistory[idx].timestamp, solar24hHistory[idx].current);
+                     solar24hHistory[idx].timestamp,
+                     solar24hHistory[idx].portCurrent,
+                     solar24hHistory[idx].stbdCurrent);
   }
   pos += snprintf(solarHistoryBuf + pos, sizeof(solarHistoryBuf) - pos, "]");
   server.sendHeader("Connection", "close");
@@ -887,7 +1262,7 @@ const char SOLAR_PAGE_HTML[] PROGMEM = R"HTML(
 <style>
   :root {
     --bg: #0f1720; --card: #182634; --text: #e8eef4; --muted: #8ea0b3;
-    --accent2: #ffb020; --border: #24384a;
+    --accent2: #ffb020; --blue: #5b9dff; --border: #24384a;
   }
   * { box-sizing: border-box; }
   body {
@@ -927,22 +1302,34 @@ async function loadHistory() {
     const r = await fetch('/solar-history');
     const data = await r.json();
     const labels = data.map(p => fmtTime(p.t));
-    const currents = data.map(p => p.c);
+    const portCurrents = data.map(p => p.p);
+    const stbdCurrents = data.map(p => p.s);
 
     if (!solarChart) {
       solarChart = new Chart(document.getElementById('solarChart'), {
         type: 'line',
         data: {
           labels,
-          datasets: [{
-            label: 'Charge Current (A)',
-            data: currents,
-            borderColor: '#ffb020',
-            backgroundColor: 'rgba(255, 176, 32, 0.1)',
-            fill: true,
-            tension: 0.3,
-            pointRadius: 0
-          }]
+          datasets: [
+            {
+              label: 'Port Solar (A)',
+              data: portCurrents,
+              borderColor: '#ffb020',
+              backgroundColor: 'rgba(255, 176, 32, 0.1)',
+              fill: false,
+              tension: 0.3,
+              pointRadius: 0
+            },
+            {
+              label: 'Starboard Solar (A)',
+              data: stbdCurrents,
+              borderColor: '#5b9dff',
+              backgroundColor: 'rgba(91, 157, 255, 0.1)',
+              fill: false,
+              tension: 0.3,
+              pointRadius: 0
+            }
+          ]
         },
         options: {
           responsive: true,
@@ -957,7 +1344,8 @@ async function loadHistory() {
       });
     } else {
       solarChart.data.labels = labels;
-      solarChart.data.datasets[0].data = currents;
+      solarChart.data.datasets[0].data = portCurrents;
+      solarChart.data.datasets[1].data = stbdCurrents;
       solarChart.update();
     }
   } catch (e) {
@@ -977,30 +1365,161 @@ void handleSolarPage() {
 }
 
 // ---------------------------------------------------------------------
-// Rolling 24-hour Battery Shunt Current History (144 samples @ 10-min interval)
+// 30-Day Solar Yield & Peak Current Web Page & Endpoint
 // ---------------------------------------------------------------------
-const uint32_t SHUNT_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
-const int SHUNT_24H_SIZE = 144;
+char solar30dBuf[4096];
 
-struct ShuntHistoryPoint {
-  uint32_t timestamp;
-  float current;
-};
+void handleSolar30dHistory() {
+  int pos = 0;
+  pos += snprintf(solar30dBuf + pos, sizeof(solar30dBuf) - pos, "[");
+  for (int i = 0; i < solar30dCount; i++) {
+    if (pos >= (int)sizeof(solar30dBuf) - 128) break;
+    pos += snprintf(solar30dBuf + pos, sizeof(solar30dBuf) - pos,
+                     "%s{\"day\":%u,\"pMax\":%.2f,\"sMax\":%.2f,\"pYield\":%.1f,\"sYield\":%.1f}",
+                     (i > 0) ? "," : "",
+                     solar30dHistory[i].epochDay,
+                     solar30dHistory[i].portMaxAmps,
+                     solar30dHistory[i].stbdMaxAmps,
+                     solar30dHistory[i].portYieldAh,
+                     solar30dHistory[i].stbdYieldAh);
+  }
+  pos += snprintf(solar30dBuf + pos, sizeof(solar30dBuf) - pos, "]");
+  server.sendHeader("Connection", "close");
+  server.send(200, "application/json", solar30dBuf);
+}
 
-ShuntHistoryPoint shunt24hHistory[SHUNT_24H_SIZE];
-int shunt24hHead = 0;
-int shunt24hCount = 0;
-uint32_t lastShunt24hSampleAt = 0;
+const char YIELD_PAGE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar Yield (30 Days)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0f1720; --card: #182634; --text: #e8eef4; --muted: #8ea0b3;
+    --accent2: #ffb020; --blue: #5b9dff; --border: #24384a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin: 0; }
+  .back-btn {
+    color: var(--muted); text-decoration: none; font-size: 0.9rem;
+    padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--card);
+  }
+  .back-btn:hover { color: var(--text); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1>Solar Daily Performance (Last 30 Days)</h1>
+    <a href="/" class="back-btn">&larr; Dashboard</a>
+  </div>
+  <div class="card">
+    <canvas id="yieldChart" height="120"></canvas>
+  </div>
+  <div class="card">
+    <canvas id="maxAmpsChart" height="120"></canvas>
+  </div>
+</div>
 
+<script>
+function fmtDay(epochDay) {
+  const d = new Date(epochDay * 86400 * 1000);
+  return (d.getUTCMonth() + 1) + '/' + d.getUTCDate();
+}
+
+async function load30d() {
+  try {
+    const r = await fetch('/solar-yield-history');
+    const data = await r.json();
+    const labels = data.map(p => fmtDay(p.day));
+
+    new Chart(document.getElementById('yieldChart'), {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Port Yield (Ah)', data: data.map(p => p.pYield), backgroundColor: '#ffb020' },
+          { label: 'Stbd Yield (Ah)', data: data.map(p => p.sYield), backgroundColor: '#5b9dff' }
+        ]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { ticks: { color: '#8ea0b3' } },
+          y: { ticks: { color: '#8ea0b3' }, beginAtZero: true }
+        },
+        plugins: {
+          title: { display: true, text: 'Daily Yield (Ah)', color: '#e8eef4' },
+          legend: { labels: { color: '#e8eef4' } }
+        }
+      }
+    });
+
+    new Chart(document.getElementById('maxAmpsChart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Port Peak (A)', data: data.map(p => p.pMax), borderColor: '#ffb020', backgroundColor: 'rgba(255, 176, 32, 0.1)', tension: 0.2 },
+          { label: 'Stbd Peak (A)', data: data.map(p => p.sMax), borderColor: '#5b9dff', backgroundColor: 'rgba(91, 157, 255, 0.1)', tension: 0.2 }
+        ]
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { ticks: { color: '#8ea0b3' } },
+          y: { ticks: { color: '#8ea0b3' }, beginAtZero: true }
+        },
+        plugins: {
+          title: { display: true, text: 'Daily Peak Current (A)', color: '#e8eef4' },
+          legend: { labels: { color: '#e8eef4' } }
+        }
+      }
+    });
+  } catch (e) {
+    console.error(e);
+  }
+}
+load30d();
+</script>
+</body>
+</html>
+)HTML";
+
+void handleYieldPage() {
+  server.sendHeader("Connection", "close");
+  server.send_P(200, "text/html", YIELD_PAGE_HTML);
+}
+
+// ---------------------------------------------------------------------
+// Rolling 24-hour Battery Shunt Current History (10-min interval averaging)
+// ---------------------------------------------------------------------
 void pollShuntHistory() {
-  if (!shuntLatest.valid) return;
   uint32_t now = millis();
+  
   if (lastShunt24hSampleAt != 0 && now - lastShunt24hSampleAt < SHUNT_24H_INTERVAL_MS) return;
   lastShunt24hSampleAt = now;
 
-  shunt24hHistory[shunt24hHead] = { currentTimestamp(), (float)shuntLatest.data.current };
-  shunt24hHead = (shunt24hHead + 1) % SHUNT_24H_SIZE;
-  if (shunt24hCount < SHUNT_24H_SIZE) shunt24hCount++;
+  if (shuntSampleCount > 0) {
+    float avgCurrent = shuntSumCurrent / (float)shuntSampleCount;
+
+    shunt24hHistory[shunt24hHead] = { currentTimestamp(), avgCurrent };
+    shunt24hHead = (shunt24hHead + 1) % SHUNT_24H_SIZE;
+    if (shunt24hCount < SHUNT_24H_SIZE) shunt24hCount++;
+
+    shuntSumCurrent = 0;
+    shuntSampleCount = 0;
+  }
 }
 
 char shuntHistoryBuf[8192];
@@ -1123,23 +1642,8 @@ void handleShuntPage() {
 }
 
 // ---------------------------------------------------------------------
-// Rolling 24-hour Temperature History (144 samples @ 10-min interval)
+// Rolling 24-hour Temperature History
 // ---------------------------------------------------------------------
-const uint32_t TEMP_24H_INTERVAL_MS = 10UL * 60 * 1000UL;
-const int TEMP_24H_SIZE = 144;
-
-struct TempHistoryPoint {
-  uint32_t timestamp;
-  float cabin1;
-  float cabin2;
-  float outside;
-};
-
-TempHistoryPoint temp24hHistory[TEMP_24H_SIZE];
-int temp24hHead = 0;
-int temp24hCount = 0;
-uint32_t lastTemp24hSampleAt = 0;
-
 void pollTempHistory() {
   if (!tempLatest.valid) return;
   uint32_t now = millis();
@@ -1308,7 +1812,7 @@ void handleRoot() {
 
 void handleData() {
   uint32_t now = millis();
-  char buf[2000];
+  char buf[2800];
 
   double tankMaxPct = tankLevelMaxLast1h(now);
   bool tankMaxValid = tankMaxPct >= 0;
@@ -1322,6 +1826,21 @@ void handleData() {
     struct tm localTm;
     localtime_r(&nowEpoch, &localTm);
     strftime(gpsTimeStr, sizeof(gpsTimeStr), "%I:%M:%S %p", &localTm);
+  }
+
+  char dawnStr[16] = "null", riseStr[16] = "null", setStr[16] = "null", duskStr[16] = "null";
+  bool sunValid = false;
+  if (gpsFix.valid && gpsTimeValid) {
+    time_t nowUtc = time(nullptr);
+    SunTimes st = calculateSunTimes(gpsFix.lat, gpsFix.lon, nowUtc);
+    if (st.valid) {
+      struct tm t;
+      localtime_r(&st.civilDawn, &t); strftime(dawnStr, sizeof(dawnStr), "\"%I:%M %p\"", &t);
+      localtime_r(&st.sunrise, &t);   strftime(riseStr, sizeof(riseStr), "\"%I:%M %p\"", &t);
+      localtime_r(&st.sunset, &t);    strftime(setStr, sizeof(setStr), "\"%I:%M %p\"", &t);
+      localtime_r(&st.civilDusk, &t);  strftime(duskStr, sizeof(duskStr), "\"%I:%M %p\"", &t);
+      sunValid = true;
+    }
   }
 
   char cabin1Str[16] = "null", cabin2Str[16] = "null", outsideStr[16] = "null";
@@ -1339,7 +1858,14 @@ void handleData() {
         "\"alarmLowVoltage\":%s,\"alarmHighVoltage\":%s,"
         "\"alarmLowSOC\":%s,\"alarmLowTemperature\":%s,\"alarmHighTemperature\":%s"
       "},"
-      "\"solar\":{"
+      "\"sun\":{\"valid\":%s,\"dawn\":%s,\"rise\":%s,\"set\":%s,\"dusk\":%s},"
+      "\"solarPort\":{"
+        "\"valid\":%s,\"ageMs\":%lu,"
+        "\"chargeState\":\"%s\",\"batteryVoltage\":%.3f,\"batteryCurrent\":%.3f,"
+        "\"panelPower\":%.1f,\"yieldToday\":%u,"
+        "\"maxCurrent10h\":%.3f"
+      "},"
+      "\"solarStbd\":{"
         "\"valid\":%s,\"ageMs\":%lu,"
         "\"chargeState\":\"%s\",\"batteryVoltage\":%.3f,\"batteryCurrent\":%.3f,"
         "\"panelPower\":%.1f,\"yieldToday\":%u,"
@@ -1367,12 +1893,20 @@ void handleData() {
     shuntLatest.data.alarmLowSOC ? "true" : "false",
     shuntLatest.data.alarmLowTemperature ? "true" : "false",
     shuntLatest.data.alarmHighTemperature ? "true" : "false",
-    solarLatest.valid ? "true" : "false",
-    (unsigned long)(solarLatest.valid ? now - solarLatest.lastUpdate : 0),
-    chargeStateName(solarLatest.data.chargeState),
-    solarLatest.data.batteryVoltage, solarLatest.data.batteryCurrent,
-    solarLatest.data.panelPower, solarLatest.data.yieldToday,
-    solarMaxCurrentLast10h(now),
+    sunValid ? "true" : "false",
+    dawnStr, riseStr, setStr, duskStr,
+    solarPortLatest.valid ? "true" : "false",
+    (unsigned long)(solarPortLatest.valid ? now - solarPortLatest.lastUpdate : 0),
+    chargeStateName(solarPortLatest.data.chargeState),
+    solarPortLatest.data.batteryVoltage, solarPortLatest.data.batteryCurrent,
+    solarPortLatest.data.panelPower, solarPortLatest.data.yieldToday,
+    solarMaxCurrentLast10h(solarPortHistoryTracker, now),
+    solarStbdLatest.valid ? "true" : "false",
+    (unsigned long)(solarStbdLatest.valid ? now - solarStbdLatest.lastUpdate : 0),
+    chargeStateName(solarStbdLatest.data.chargeState),
+    solarStbdLatest.data.batteryVoltage, solarStbdLatest.data.batteryCurrent,
+    solarStbdLatest.data.panelPower, solarStbdLatest.data.yieldToday,
+    solarMaxCurrentLast10h(solarStbdHistoryTracker, now),
     tempLatest.valid ? "true" : "false",
     (unsigned long)(tempLatest.valid ? now - tempLatest.lastUpdate : 0),
     cabin1Str, cabin2Str, outsideStr,
@@ -1399,11 +1933,7 @@ void handleData() {
     iceboxLatest.crisperTempC,
     iceboxLatest.compressorOn ? "true" : "false",
     iceboxLatest.dutyPercent,
-    (unsigned long)(millis() / 1000),
-    (unsigned)ESP.getFreeHeap(),
-    (unsigned)ESP.getMinFreeHeap(),
-    (unsigned)ESP.getMaxAllocHeap(),
-    (unsigned)bootFreeHeap
+    (unsigned long)(millis() / 1000)
   );
 
   (void)len;
@@ -1442,8 +1972,12 @@ void maintainWiFi() {
 void setup() {
   esp_log_level_set("*", ESP_LOG_NONE);
 
+  loadSolar30dHistory();
+
   server.on("/solar", handleSolarPage);
   server.on("/solar-history", handleSolarHistory);
+  server.on("/solar-yield", handleYieldPage);
+  server.on("/solar-yield-history", handleSolar30dHistory);
   server.on("/shunt", handleShuntPage);
   server.on("/shunt-history", handleShuntHistory);
   server.on("/temps", handleTempsPage);
@@ -1489,12 +2023,15 @@ void setup() {
   victron.setCallback(onVictronData);
   victron.setMinInterval(1000);
 
-  victron.addDevice("Solar Charger", SOLAR_MAC, SOLAR_KEY, DEVICE_TYPE_SOLAR_CHARGER);
+  victron.addDevice("Port Solar", SOLAR_PORT_MAC, SOLAR_PORT_KEY, DEVICE_TYPE_SOLAR_CHARGER);
+  victron.addDevice("Starboard Solar", SOLAR_STBD_MAC, SOLAR_STBD_KEY, DEVICE_TYPE_SOLAR_CHARGER);
   victron.addDevice("Battery Shunt", SHUNT_MAC, SHUNT_KEY, DEVICE_TYPE_BATTERY_MONITOR);
 
-  navUdp.begin(NAV_UDP_PORT);
-  Serial.print("Listening for GPS/AIS on UDP:");
-  Serial.println(NAV_UDP_PORT);
+  Serial.printf("Connecting to GPS TCP endpoint %s:%d...\n", GPS_HOST, GPS_PORT);
+  gpsClient.connect(GPS_HOST, GPS_PORT);
+
+  Serial.printf("Connecting to AIS TCP endpoint %s:%d...\n", AIS_HOST, AIS_PORT);
+  aisClient.connect(AIS_HOST, AIS_PORT);
 
   telemetryUdp.begin(TELEMETRY_UDP_PORT);
   Serial.print("Listening for heater/icebox telemetry on UDP:");
@@ -1505,9 +2042,6 @@ void setup() {
   server.begin();
   Serial.println("Web server started.");
   Serial.println("Dashboard: http://192.168.8.66/");
-
-  bootFreeHeap = ESP.getFreeHeap();
-  Serial.printf("Boot free heap: %u bytes\n", (unsigned)bootFreeHeap);
 
   esp_task_wdt_deinit();
   esp_task_wdt_config_t wdtConfig = {
@@ -1542,12 +2076,14 @@ void loop() {
   esp_task_wdt_reset();
   maintainWiFi();
 
-  pollNav();
+  pollGpsTcp();
+  pollAisTcp();
 
   victron.loop();
   pollTelemetry();
   pollTemps();
   pollSolarHistory();
+  pollSolar30dHistory();
   pollShuntHistory();
   pollTempHistory();
   server.handleClient();
